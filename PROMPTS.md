@@ -31,3 +31,7 @@ implementing the assignment.
 13. Replace the generic event `Command` with typed `LoginCommand`,
     `UpdateCommand`, and `LogoutCommand` inputs and separate decision functions;
     make the change locally without pushing it yet.
+14. After the typed-command PR was approved and merged, implement only Step 2:
+    define the atomic `SessionRepository.Mutate(ctx, key, fn)` boundary and a
+    reusable test contract for future memory and PostgreSQL adapters, using the
+    required red-then-green workflow.
