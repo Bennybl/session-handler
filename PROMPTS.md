@@ -83,3 +83,6 @@ implementing the assignment.
     transport-neutral consumer, stdin NDJSON source, durable NATS JetStream
     source, explicit post-commit acknowledgements, delayed retry, dead lettering,
     termination, bounded retention, and ordered one-message delivery.
+27. Start Step 11 locally without committing or pushing: add the test-first,
+    query-only HTTP API with strict generic filter decoding, pagination, complete
+    history responses, default-now behavior, and no event-ingestion route.
