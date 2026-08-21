@@ -12,7 +12,7 @@ import (
 
 func loadSnapshot(ctx context.Context, tx *sql.Tx, key session.SessionKey) (session.CurrentSessionSnapshot, error) {
 	rows, err := tx.QueryContext(ctx, `
-		SELECT id::text, login_at, logout_at
+		SELECT id::text, login_at, logout_at, last_event_id::text
 		FROM sessions
 		WHERE tenant_id = $1 AND username = $2 AND ip = $3::inet
 		ORDER BY login_at, id
@@ -28,12 +28,17 @@ func loadSnapshot(ctx context.Context, tx *sql.Tx, key session.SessionKey) (sess
 			id       string
 			loginAt  time.Time
 			logoutAt sql.NullTime
+			eventID  sql.NullString
 		)
-		if err := rows.Scan(&id, &loginAt, &logoutAt); err != nil {
+		if err := rows.Scan(&id, &loginAt, &logoutAt, &eventID); err != nil {
 			_ = rows.Close()
 			return session.CurrentSessionSnapshot{}, fmt.Errorf("scan session history: %w", err)
 		}
 		advanceLatest(&snapshot, loginAt)
+		snapshot.LastEventID = ""
+		if eventID.Valid {
+			snapshot.LastEventID = eventID.String
+		}
 		if logoutAt.Valid {
 			advanceLatest(&snapshot, logoutAt.Time)
 			continue
@@ -42,7 +47,7 @@ func loadSnapshot(ctx context.Context, tx *sql.Tx, key session.SessionKey) (sess
 			_ = rows.Close()
 			return session.CurrentSessionSnapshot{}, invalidMutation("session key has multiple active lifecycles")
 		}
-		snapshot.Active = &session.Session{ID: id, Key: key, LoginAt: loginAt}
+		snapshot.Active = &session.Session{ID: id, Key: key, LoginAt: loginAt, LastEventID: snapshot.LastEventID}
 	}
 	if err := rows.Close(); err != nil {
 		return session.CurrentSessionSnapshot{}, fmt.Errorf("close session history rows: %w", err)
@@ -127,6 +132,13 @@ func persistMutation(ctx context.Context, tx *sql.Tx, key session.SessionKey, sn
 			return invalidMutation("end mutation is nil")
 		}
 		return persistEnd(ctx, tx, snapshot, *value)
+	case session.DuplicateEvent:
+		return persistDuplicate(snapshot, value)
+	case *session.DuplicateEvent:
+		if value == nil {
+			return invalidMutation("duplicate mutation is nil")
+		}
+		return persistDuplicate(snapshot, *value)
 	default:
 		return invalidMutation("unsupported mutation type %T", mutation)
 	}
@@ -134,8 +146,11 @@ func persistMutation(ctx context.Context, tx *sql.Tx, key session.SessionKey, sn
 
 func persistStart(ctx context.Context, tx *sql.Tx, key session.SessionKey, snapshot session.CurrentSessionSnapshot, mutation session.StartSession) error {
 	value := mutation.Session
-	if snapshot.Active != nil || value.ID == "" || value.Key != key || value.LoginAt.IsZero() || value.LogoutAt != nil || len(value.States) != 1 {
+	if snapshot.Active != nil || value.ID == "" || value.Key != key || value.LoginAt.IsZero() || value.LogoutAt != nil || len(value.States) != 1 || value.LastEventID != mutation.EventID {
 		return invalidMutation("start mutation is inconsistent")
+	}
+	if err := validateAcceptedEventID(mutation.EventID, snapshot.LastEventID); err != nil {
+		return err
 	}
 	state := value.States[0]
 	if state.ValidFrom.IsZero() || !state.ValidFrom.Equal(value.LoginAt) || state.ValidTo != nil {
@@ -145,9 +160,9 @@ func persistStart(ctx context.Context, tx *sql.Tx, key session.SessionKey, snaps
 		return invalidMutation("start mutation precedes latest event")
 	}
 	if _, err := tx.ExecContext(ctx, `
-		INSERT INTO sessions (id, tenant_id, username, ip, login_at)
-		VALUES ($1::uuid, $2, $3, $4::inet, $5)
-	`, value.ID, key.TenantID, key.Username, key.IP, value.LoginAt); err != nil {
+		INSERT INTO sessions (id, tenant_id, username, ip, login_at, last_event_id)
+		VALUES ($1::uuid, $2, $3, $4::inet, $5, $6::uuid)
+	`, value.ID, key.TenantID, key.Username, key.IP, value.LoginAt, mutation.EventID); err != nil {
 		return fmt.Errorf("insert session: %w", err)
 	}
 	if _, err := tx.ExecContext(ctx, `
@@ -160,6 +175,9 @@ func persistStart(ctx context.Context, tx *sql.Tx, key session.SessionKey, snaps
 }
 
 func persistReplace(ctx context.Context, tx *sql.Tx, snapshot session.CurrentSessionSnapshot, mutation session.ReplaceState) error {
+	if err := validateAcceptedEventID(mutation.EventID, snapshot.LastEventID); err != nil {
+		return err
+	}
 	if snapshot.Active == nil || mutation.SessionID != snapshot.Active.ID || mutation.CloseCurrentAt.IsZero() {
 		return invalidMutation("state replacement does not identify the active session")
 	}
@@ -178,10 +196,16 @@ func persistReplace(ctx context.Context, tx *sql.Tx, snapshot session.CurrentSes
 	`, mutation.SessionID, mutation.State.Tags, mutation.State.ValidFrom); err != nil {
 		return fmt.Errorf("insert replacement session state: %w", err)
 	}
+	if err := updateEventID(ctx, tx, mutation.SessionID, mutation.EventID); err != nil {
+		return err
+	}
 	return nil
 }
 
 func persistEnd(ctx context.Context, tx *sql.Tx, snapshot session.CurrentSessionSnapshot, mutation session.EndSession) error {
+	if err := validateAcceptedEventID(mutation.EventID, snapshot.LastEventID); err != nil {
+		return err
+	}
 	if snapshot.Active == nil || mutation.SessionID != snapshot.Active.ID || mutation.CloseCurrentAt.IsZero() || !mutation.CloseCurrentAt.Equal(mutation.LogoutAt) {
 		return invalidMutation("end mutation does not identify the active session")
 	}
@@ -192,14 +216,41 @@ func persistEnd(ctx context.Context, tx *sql.Tx, snapshot session.CurrentSession
 		return err
 	}
 	result, err := tx.ExecContext(ctx, `
-		UPDATE sessions SET logout_at = $1
-		WHERE id = $2::uuid AND logout_at IS NULL
-	`, mutation.LogoutAt, mutation.SessionID)
+		UPDATE sessions SET logout_at = $1, last_event_id = $2::uuid
+		WHERE id = $3::uuid AND logout_at IS NULL
+	`, mutation.LogoutAt, mutation.EventID, mutation.SessionID)
 	if err != nil {
 		return fmt.Errorf("close session: %w", err)
 	}
 	if err := requireOneRow(result, "close session"); err != nil {
 		return err
+	}
+	return nil
+}
+
+func persistDuplicate(snapshot session.CurrentSessionSnapshot, mutation session.DuplicateEvent) error {
+	normalized, err := session.NormalizeEventID(mutation.EventID)
+	if err != nil || normalized != mutation.EventID || snapshot.LastEventID != mutation.EventID {
+		return invalidMutation("duplicate mutation does not match the latest event ID")
+	}
+	return nil
+}
+
+func updateEventID(ctx context.Context, tx *sql.Tx, sessionID, eventID string) error {
+	result, err := tx.ExecContext(ctx, `
+		UPDATE sessions SET last_event_id = $1::uuid
+		WHERE id = $2::uuid
+	`, eventID, sessionID)
+	if err != nil {
+		return fmt.Errorf("update session event identity: %w", err)
+	}
+	return requireOneRow(result, "update session event identity")
+}
+
+func validateAcceptedEventID(eventID, previous string) error {
+	normalized, err := session.NormalizeEventID(eventID)
+	if err != nil || normalized != eventID || eventID == previous {
+		return invalidMutation("accepted event ID is invalid or already current")
 	}
 	return nil
 }

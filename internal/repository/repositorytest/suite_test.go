@@ -15,6 +15,7 @@ func TestCasesExposeTheSharedAdapterContract(t *testing.T) {
 		"generic state scoped filters",
 		"pagination and stable cursors",
 		"query result isolation",
+		"event ID atomicity and deduplication",
 	}
 
 	cases := Cases()

@@ -18,6 +18,7 @@ type Repository struct {
 	mu       sync.RWMutex
 	sessions map[session.SessionKey][]session.Session
 	latest   map[session.SessionKey]time.Time
+	eventIDs map[session.SessionKey]string
 	ids      map[string]struct{}
 	closed   bool
 }
@@ -26,6 +27,7 @@ func New() *Repository {
 	return &Repository{
 		sessions: make(map[session.SessionKey][]session.Session),
 		latest:   make(map[session.SessionKey]time.Time),
+		eventIDs: make(map[session.SessionKey]string),
 		ids:      make(map[string]struct{}),
 	}
 }
@@ -127,6 +129,7 @@ func (r *Repository) Close() error {
 	r.closed = true
 	r.sessions = nil
 	r.latest = nil
+	r.eventIDs = nil
 	r.ids = nil
 	return nil
 }
@@ -137,6 +140,7 @@ func (r *Repository) snapshot(key session.SessionKey) session.CurrentSessionSnap
 		value := latest
 		snapshot.LastEventAt = &value
 	}
+	snapshot.LastEventID = r.eventIDs[key]
 	history := r.sessions[key]
 	for index := len(history) - 1; index >= 0; index-- {
 		if history[index].LogoutAt == nil {
@@ -171,6 +175,13 @@ func (r *Repository) apply(key session.SessionKey, mutation session.Mutation) er
 			return invalidMutation("end mutation is nil")
 		}
 		return r.end(key, *value)
+	case session.DuplicateEvent:
+		return r.duplicate(key, value)
+	case *session.DuplicateEvent:
+		if value == nil {
+			return invalidMutation("duplicate mutation is nil")
+		}
+		return r.duplicate(key, *value)
 	default:
 		return invalidMutation("unsupported mutation type %T", mutation)
 	}
@@ -178,8 +189,11 @@ func (r *Repository) apply(key session.SessionKey, mutation session.Mutation) er
 
 func (r *Repository) start(key session.SessionKey, mutation session.StartSession) error {
 	value := mutation.Session
-	if value.ID == "" || value.Key != key || value.LoginAt.IsZero() || value.LogoutAt != nil || len(value.States) != 1 {
+	if value.ID == "" || value.Key != key || value.LoginAt.IsZero() || value.LogoutAt != nil || len(value.States) != 1 || value.LastEventID != mutation.EventID {
 		return invalidMutation("start mutation is inconsistent")
+	}
+	if err := validateAcceptedEventID(mutation.EventID, r.eventIDs[key]); err != nil {
+		return err
 	}
 	state := value.States[0]
 	if state.ValidFrom.IsZero() || !state.ValidFrom.Equal(value.LoginAt) || state.ValidTo != nil {
@@ -197,11 +211,15 @@ func (r *Repository) start(key session.SessionKey, mutation session.StartSession
 	value = cloneSession(value)
 	r.sessions[key] = append(r.sessions[key], value)
 	r.latest[key] = value.LoginAt
+	r.eventIDs[key] = mutation.EventID
 	r.ids[value.ID] = struct{}{}
 	return nil
 }
 
 func (r *Repository) replace(key session.SessionKey, mutation session.ReplaceState) error {
+	if err := validateAcceptedEventID(mutation.EventID, r.eventIDs[key]); err != nil {
+		return err
+	}
 	history := r.sessions[key]
 	index := activeIndex(history)
 	if index < 0 || history[index].ID != mutation.SessionID || mutation.CloseCurrentAt.IsZero() {
@@ -220,12 +238,17 @@ func (r *Repository) replace(key session.SessionKey, mutation session.ReplaceSta
 	closedAt := mutation.CloseCurrentAt
 	active.States[len(active.States)-1].ValidTo = &closedAt
 	active.States = append(active.States, cloneState(mutation.State))
+	active.LastEventID = mutation.EventID
 	r.sessions[key] = history
 	r.latest[key] = mutation.CloseCurrentAt
+	r.eventIDs[key] = mutation.EventID
 	return nil
 }
 
 func (r *Repository) end(key session.SessionKey, mutation session.EndSession) error {
+	if err := validateAcceptedEventID(mutation.EventID, r.eventIDs[key]); err != nil {
+		return err
+	}
 	history := r.sessions[key]
 	index := activeIndex(history)
 	if index < 0 || history[index].ID != mutation.SessionID || mutation.CloseCurrentAt.IsZero() || !mutation.CloseCurrentAt.Equal(mutation.LogoutAt) {
@@ -242,8 +265,26 @@ func (r *Repository) end(key session.SessionKey, mutation session.EndSession) er
 	logoutAt := mutation.LogoutAt
 	active.States[len(active.States)-1].ValidTo = &closedAt
 	active.LogoutAt = &logoutAt
+	active.LastEventID = mutation.EventID
 	r.sessions[key] = history
 	r.latest[key] = logoutAt
+	r.eventIDs[key] = mutation.EventID
+	return nil
+}
+
+func (r *Repository) duplicate(key session.SessionKey, mutation session.DuplicateEvent) error {
+	normalized, err := session.NormalizeEventID(mutation.EventID)
+	if err != nil || normalized != mutation.EventID || r.eventIDs[key] != mutation.EventID {
+		return invalidMutation("duplicate mutation does not match the latest event ID")
+	}
+	return nil
+}
+
+func validateAcceptedEventID(eventID, previous string) error {
+	normalized, err := session.NormalizeEventID(eventID)
+	if err != nil || normalized != eventID || eventID == previous {
+		return invalidMutation("accepted event ID is invalid or already current")
+	}
 	return nil
 }
 

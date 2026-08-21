@@ -71,3 +71,7 @@ implementing the assignment.
     Step 7 with tests first: add PostgreSQL declarative registry queries,
     same-state predicates, parameter binding, distinct keyset pagination, and
     complete session-history loading, then open its dedicated PR.
+24. After the PostgreSQL query PR was approved and merged, implement only Step
+    8 with tests first: require UUID event IDs, normalize and propagate them,
+    atomically persist the latest ID in both adapters, and make immediate stream
+    redelivery a successful duplicate no-op without retaining raw events.

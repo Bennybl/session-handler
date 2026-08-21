@@ -19,8 +19,10 @@ import (
 )
 
 const (
-	repositoryTestSchema = "session_handler_repository_test"
-	firstSessionID       = "00000000-0000-0000-0000-000000000101"
+	repositoryTestSchema  = "session_handler_repository_test"
+	firstSessionID        = "00000000-0000-0000-0000-000000000101"
+	postgresLoginEventID  = "30000000-0000-4000-8000-000000000001"
+	postgresUpdateEventID = "30000000-0000-4000-8000-000000000002"
 )
 
 func TestMutateContract(t *testing.T) {
@@ -40,6 +42,12 @@ func TestMutateContract(t *testing.T) {
 			})
 		})
 	}
+}
+
+func TestEventIDContract(t *testing.T) {
+	repositorytest.EventIDCase().Run(t, func(t *testing.T) repository.SessionRepository {
+		return newRepository(t, true)
+	})
 }
 
 func TestMutateDifferentKeysDoNotShareAnAdvisoryLock(t *testing.T) {
@@ -211,7 +219,7 @@ func TestMutatePersistenceFailureRollsBackEarlierStatements(t *testing.T) {
 	updateAt := loginAt.Add(time.Hour)
 	err := repo.Mutate(context.Background(), key, func(snapshot session.CurrentSessionSnapshot) (session.Mutation, error) {
 		return session.DecideUpdate(snapshot, session.UpdateCommand{
-			Key: key, Tags: []string{"force-db-error"}, Timestamp: updateAt,
+			EventID: postgresUpdateEventID, Key: key, Tags: []string{"force-db-error"}, Timestamp: updateAt,
 		})
 	})
 	if err == nil {
@@ -222,6 +230,9 @@ func TestMutatePersistenceFailureRollsBackEarlierStatements(t *testing.T) {
 	err = repo.Mutate(context.Background(), key, func(snapshot session.CurrentSessionSnapshot) (session.Mutation, error) {
 		if snapshot.LastEventAt == nil || !snapshot.LastEventAt.Equal(loginAt) {
 			t.Fatalf("LastEventAt after rollback = %v, want %v", snapshot.LastEventAt, loginAt)
+		}
+		if snapshot.LastEventID != postgresLoginEventID {
+			t.Fatalf("LastEventID after rollback = %q, want %q", snapshot.LastEventID, postgresLoginEventID)
 		}
 		if snapshot.Active == nil || len(snapshot.Active.States) != 1 {
 			t.Fatalf("Active after rollback = %+v", snapshot.Active)
@@ -353,7 +364,7 @@ func seedLogin(t *testing.T, repo repository.SessionRepository, key session.Sess
 	t.Helper()
 	if err := repo.Mutate(context.Background(), key, func(snapshot session.CurrentSessionSnapshot) (session.Mutation, error) {
 		return session.DecideLogin(snapshot, session.LoginCommand{
-			SessionID: id, Key: key, Tags: []string{"user"}, Timestamp: at,
+			EventID: postgresLoginEventID, SessionID: id, Key: key, Tags: []string{"user"}, Timestamp: at,
 		})
 	}); err != nil {
 		t.Fatalf("seed login: %v", err)

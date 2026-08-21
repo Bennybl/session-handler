@@ -157,7 +157,8 @@ read-modify-write operation. The repository must:
 
 The callback is side-effect-free because an adapter may retry it. It receives the
 latest accepted timestamp and event ID, active lifecycle, and current state, and
-returns one of `StartSession`, `ReplaceState`, or `EndSession`.
+returns `StartSession`, `ReplaceState`, `EndSession`, or a successful
+`DuplicateEvent` no-op when the message repeats the latest accepted event ID.
 
 Each adapter chooses its concurrency mechanism:
 

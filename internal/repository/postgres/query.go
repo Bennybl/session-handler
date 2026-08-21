@@ -240,7 +240,7 @@ func (r *Repository) loadSessions(ctx context.Context, ids []string) ([]session.
 		placeholders[index] = parameters.add(id) + "::uuid"
 	}
 	rows, err := r.db.QueryContext(ctx, `
-		SELECT s.id::text, s.tenant_id, s.username, host(s.ip), s.login_at, s.logout_at,
+		SELECT s.id::text, s.tenant_id, s.username, host(s.ip), s.login_at, s.logout_at, s.last_event_id::text,
 		       to_json(ss.tags)::text, ss.valid_from, ss.valid_to
 		FROM sessions s
 		JOIN session_states ss ON ss.session_id = s.id
@@ -258,11 +258,12 @@ func (r *Repository) loadSessions(ctx context.Context, ids []string) ([]session.
 			id, tenantID, username, ip string
 			loginAt                    time.Time
 			logoutAt                   sql.NullTime
+			eventID                    sql.NullString
 			tagsJSON                   string
 			validFrom                  time.Time
 			validTo                    sql.NullTime
 		)
-		if err := rows.Scan(&id, &tenantID, &username, &ip, &loginAt, &logoutAt, &tagsJSON, &validFrom, &validTo); err != nil {
+		if err := rows.Scan(&id, &tenantID, &username, &ip, &loginAt, &logoutAt, &eventID, &tagsJSON, &validFrom, &validTo); err != nil {
 			return nil, fmt.Errorf("scan PostgreSQL session: %w", err)
 		}
 		var tags []string
@@ -272,6 +273,9 @@ func (r *Repository) loadSessions(ctx context.Context, ids []string) ([]session.
 		value := byID[id]
 		if value == nil {
 			value = &session.Session{ID: id, Key: session.SessionKey{TenantID: tenantID, Username: username, IP: ip}, LoginAt: loginAt}
+			if eventID.Valid {
+				value.LastEventID = eventID.String
+			}
 			if logoutAt.Valid {
 				closedAt := logoutAt.Time
 				value.LogoutAt = &closedAt
