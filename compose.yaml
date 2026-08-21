@@ -1,4 +1,12 @@
 services:
+  nats:
+    image: nats:2.11-alpine
+    command: ["-js", "-sd", "/data"]
+    ports:
+      - "54222:4222"
+    volumes:
+      - nats-data:/data
+
   postgres:
     image: postgres:15-alpine
     environment:
@@ -16,4 +24,5 @@ services:
       retries: 15
 
 volumes:
+  nats-data:
   postgres-data:
