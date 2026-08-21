@@ -18,13 +18,22 @@ import (
 )
 
 const (
-	aliceID   = "00000000-0000-0000-0000-000000000001"
-	bobID     = "00000000-0000-0000-0000-000000000002"
-	charlieID = "00000000-0000-0000-0000-000000000003"
+	aliceID       = "00000000-0000-0000-0000-000000000001"
+	bobID         = "00000000-0000-0000-0000-000000000002"
+	charlieID     = "00000000-0000-0000-0000-000000000003"
+	loginEventID  = "20000000-0000-4000-8000-000000000001"
+	updateEventID = "20000000-0000-4000-8000-000000000002"
+	logoutEventID = "20000000-0000-4000-8000-000000000003"
 )
 
 func TestRepositoryContract(t *testing.T) {
 	repositorytest.Run(t, func(t *testing.T) repository.SessionRepository {
+		return memory.New()
+	})
+}
+
+func TestEventIDContract(t *testing.T) {
+	repositorytest.EventIDCase().Run(t, func(t *testing.T) repository.SessionRepository {
 		return memory.New()
 	})
 }
@@ -184,7 +193,7 @@ func TestConcurrentMutationAndQueries(t *testing.T) {
 			defer wait.Done()
 			err := repo.Mutate(context.Background(), key, func(snapshot session.CurrentSessionSnapshot) (session.Mutation, error) {
 				return session.DecideUpdate(snapshot, session.UpdateCommand{
-					Key: key, Tags: []string{fmt.Sprintf("updated-%d", index)}, Timestamp: base.Add(time.Minute),
+					EventID: updateEventID, Key: key, Tags: []string{fmt.Sprintf("updated-%d", index)}, Timestamp: base.Add(time.Minute),
 				})
 			})
 			if err != nil {
@@ -275,7 +284,7 @@ func resultIDs(result session.QueryResult) []string {
 func applyLogin(t *testing.T, repo repository.SessionRepository, key session.SessionKey, id string, at time.Time, tags []string) {
 	t.Helper()
 	if err := repo.Mutate(context.Background(), key, func(snapshot session.CurrentSessionSnapshot) (session.Mutation, error) {
-		return session.DecideLogin(snapshot, session.LoginCommand{SessionID: id, Key: key, Tags: tags, Timestamp: at})
+		return session.DecideLogin(snapshot, session.LoginCommand{EventID: loginEventID, SessionID: id, Key: key, Tags: tags, Timestamp: at})
 	}); err != nil {
 		t.Fatalf("login error = %v", err)
 	}
@@ -284,7 +293,7 @@ func applyLogin(t *testing.T, repo repository.SessionRepository, key session.Ses
 func applyUpdate(t *testing.T, repo repository.SessionRepository, key session.SessionKey, at time.Time, tags []string) {
 	t.Helper()
 	if err := repo.Mutate(context.Background(), key, func(snapshot session.CurrentSessionSnapshot) (session.Mutation, error) {
-		return session.DecideUpdate(snapshot, session.UpdateCommand{Key: key, Tags: tags, Timestamp: at})
+		return session.DecideUpdate(snapshot, session.UpdateCommand{EventID: updateEventID, Key: key, Tags: tags, Timestamp: at})
 	}); err != nil {
 		t.Fatalf("update error = %v", err)
 	}
@@ -293,7 +302,7 @@ func applyUpdate(t *testing.T, repo repository.SessionRepository, key session.Se
 func applyLogout(t *testing.T, repo repository.SessionRepository, key session.SessionKey, at time.Time) {
 	t.Helper()
 	if err := repo.Mutate(context.Background(), key, func(snapshot session.CurrentSessionSnapshot) (session.Mutation, error) {
-		return session.DecideLogout(snapshot, session.LogoutCommand{Key: key, Timestamp: at})
+		return session.DecideLogout(snapshot, session.LogoutCommand{EventID: logoutEventID, Key: key, Timestamp: at})
 	}); err != nil {
 		t.Fatalf("logout error = %v", err)
 	}

@@ -15,6 +15,11 @@ const (
 	contractSession1ID = "00000000-0000-0000-0000-000000000001"
 	contractSession2ID = "00000000-0000-0000-0000-000000000002"
 	contractSession3ID = "00000000-0000-0000-0000-000000000003"
+	contractEvent1ID   = "10000000-0000-4000-8000-000000000001"
+	contractEvent2ID   = "10000000-0000-4000-8000-000000000002"
+	contractEvent3ID   = "10000000-0000-4000-8000-000000000003"
+	contractEvent4ID   = "10000000-0000-4000-8000-000000000004"
+	contractRollbackID = "10000000-0000-4000-8000-000000000099"
 )
 
 type Factory func(t *testing.T) repository.SessionRepository
@@ -32,6 +37,104 @@ func Cases() []Case {
 		{Name: "generic state scoped filters", Run: testGenericStateScopedFilters},
 		{Name: "pagination and stable cursors", Run: testPaginationAndStableCursors},
 		{Name: "query result isolation", Run: testQueryResultIsolation},
+		EventIDCase(),
+	}
+}
+
+func EventIDCase() Case {
+	return Case{Name: "event ID atomicity and deduplication", Run: testEventIDAtomicityAndDeduplication}
+}
+
+func testEventIDAtomicityAndDeduplication(t *testing.T, factory Factory) {
+	t.Helper()
+	repo := newRepository(t, factory)
+	ctx := context.Background()
+	key := mustKey(t, "tenant-a", "alice", "192.0.2.10")
+	loginAt := mustTime(t, "2026-08-21T10:00:00Z")
+	updateAt := loginAt.Add(time.Hour)
+	logoutAt := updateAt.Add(time.Hour)
+
+	if err := repo.Mutate(ctx, key, func(snapshot session.CurrentSessionSnapshot) (session.Mutation, error) {
+		return session.DecideLogin(snapshot, session.LoginCommand{
+			EventID: contractEvent1ID, SessionID: contractSession1ID, Key: key, Tags: []string{"user"}, Timestamp: loginAt,
+		})
+	}); err != nil {
+		t.Fatalf("event-ID login error = %v", err)
+	}
+	if err := repo.Mutate(ctx, key, func(snapshot session.CurrentSessionSnapshot) (session.Mutation, error) {
+		if snapshot.LastEventID != contractEvent1ID {
+			t.Fatalf("login LastEventID = %q, want %q", snapshot.LastEventID, contractEvent1ID)
+		}
+		return session.DecideUpdate(snapshot, session.UpdateCommand{
+			EventID: contractEvent2ID, Key: key, Tags: []string{"admin"}, Timestamp: updateAt,
+		})
+	}); err != nil {
+		t.Fatalf("event-ID update error = %v", err)
+	}
+
+	rollbackError := errors.New("roll back event identity")
+	if err := repo.Mutate(ctx, key, func(snapshot session.CurrentSessionSnapshot) (session.Mutation, error) {
+		mutation, decisionError := session.DecideUpdate(snapshot, session.UpdateCommand{
+			EventID: contractRollbackID, Key: key, Tags: []string{"rolled-back"}, Timestamp: updateAt.Add(time.Minute),
+		})
+		if decisionError != nil {
+			return nil, decisionError
+		}
+		return mutation, rollbackError
+	}); !errors.Is(err, rollbackError) {
+		t.Fatalf("event-ID rollback error = %v, want %v", err, rollbackError)
+	}
+
+	if err := repo.Mutate(ctx, key, func(snapshot session.CurrentSessionSnapshot) (session.Mutation, error) {
+		if snapshot.LastEventID != contractEvent2ID || snapshot.Active == nil || len(snapshot.Active.States) != 2 {
+			t.Fatalf("snapshot after rollback = %+v", snapshot)
+		}
+		return session.DecideUpdate(snapshot, session.UpdateCommand{
+			EventID: contractEvent2ID, Key: key, Tags: []string{"ignored"}, Timestamp: loginAt,
+		})
+	}); err != nil {
+		t.Fatalf("duplicate event error = %v", err)
+	}
+
+	if err := repo.Mutate(ctx, key, func(snapshot session.CurrentSessionSnapshot) (session.Mutation, error) {
+		if snapshot.LastEventID != contractEvent2ID || snapshot.Active == nil || len(snapshot.Active.States) != 2 {
+			t.Fatalf("snapshot after duplicate = %+v", snapshot)
+		}
+		return session.DecideLogout(snapshot, session.LogoutCommand{EventID: contractEvent3ID, Key: key, Timestamp: logoutAt})
+	}); err != nil {
+		t.Fatalf("event-ID logout error = %v", err)
+	}
+
+	if err := repo.Mutate(ctx, key, func(snapshot session.CurrentSessionSnapshot) (session.Mutation, error) {
+		if snapshot.LastEventID != contractEvent3ID || snapshot.Active != nil {
+			t.Fatalf("snapshot after logout = %+v", snapshot)
+		}
+		return session.DecideLogin(snapshot, session.LoginCommand{
+			EventID: contractEvent4ID, SessionID: contractSession2ID, Key: key, Tags: []string{"user"}, Timestamp: logoutAt.Add(time.Hour),
+		})
+	}); err != nil {
+		t.Fatalf("event-ID relogin error = %v", err)
+	}
+
+	probeError := errors.New("event identity inspected")
+	if err := repo.Mutate(ctx, key, func(snapshot session.CurrentSessionSnapshot) (session.Mutation, error) {
+		if snapshot.LastEventID != contractEvent4ID || snapshot.Active == nil || snapshot.Active.LastEventID != contractEvent4ID {
+			t.Fatalf("snapshot after relogin = %+v", snapshot)
+		}
+		return nil, probeError
+	}); !errors.Is(err, probeError) {
+		t.Fatalf("event-ID inspection error = %v, want %v", err, probeError)
+	}
+
+	result, err := repo.Query(ctx, session.QuerySpec{
+		Filters:     []session.Filter{{Field: "sessionId", Operator: "eq", Value: contractSession2ID}},
+		EvaluatedAt: logoutAt.Add(2 * time.Hour),
+	})
+	if err != nil {
+		t.Fatalf("event-ID query error = %v", err)
+	}
+	if len(result.Sessions) != 1 || result.Sessions[0].LastEventID != contractEvent4ID {
+		t.Fatalf("queried event identity = %+v, want %q", result.Sessions, contractEvent4ID)
 	}
 }
 
@@ -59,6 +162,7 @@ func testLifecycleSnapshots(t *testing.T, factory Factory) {
 			t.Fatalf("initial snapshot = %+v, want empty", snapshot)
 		}
 		return session.DecideLogin(snapshot, session.LoginCommand{
+			EventID:   contractEvent1ID,
 			SessionID: contractSession1ID,
 			Key:       key,
 			Tags:      []string{"user"},
@@ -72,6 +176,7 @@ func testLifecycleSnapshots(t *testing.T, factory Factory) {
 	err = repo.Mutate(ctx, key, func(snapshot session.CurrentSessionSnapshot) (session.Mutation, error) {
 		assertSnapshot(t, snapshot, contractSession1ID, loginAt, loginAt, []string{"user"})
 		return session.DecideUpdate(snapshot, session.UpdateCommand{
+			EventID:   contractEvent2ID,
 			Key:       key,
 			Tags:      []string{"admin", "user"},
 			Timestamp: updateAt,
@@ -86,7 +191,7 @@ func testLifecycleSnapshots(t *testing.T, factory Factory) {
 		if len(snapshot.Active.States) != 2 || snapshot.Active.States[0].ValidTo == nil || !snapshot.Active.States[0].ValidTo.Equal(updateAt) {
 			t.Fatalf("states after update = %+v", snapshot.Active.States)
 		}
-		return session.DecideLogout(snapshot, session.LogoutCommand{Key: key, Timestamp: logoutAt})
+		return session.DecideLogout(snapshot, session.LogoutCommand{EventID: contractEvent3ID, Key: key, Timestamp: logoutAt})
 	})
 	if err != nil {
 		t.Fatalf("logout mutation error = %v", err)
@@ -108,6 +213,7 @@ func testLifecycleSnapshots(t *testing.T, factory Factory) {
 
 	err = repo.Mutate(ctx, key, func(snapshot session.CurrentSessionSnapshot) (session.Mutation, error) {
 		return session.DecideLogin(snapshot, session.LoginCommand{
+			EventID:   contractEvent4ID,
 			SessionID: contractSession2ID,
 			Key:       key,
 			Tags:      []string{"user"},
@@ -297,7 +403,7 @@ func newRepository(t *testing.T, factory Factory) repository.SessionRepository {
 func seedLogin(t *testing.T, repo repository.SessionRepository, key session.SessionKey, id string, at time.Time, tags []string) {
 	t.Helper()
 	err := repo.Mutate(context.Background(), key, func(snapshot session.CurrentSessionSnapshot) (session.Mutation, error) {
-		return session.DecideLogin(snapshot, session.LoginCommand{SessionID: id, Key: key, Tags: tags, Timestamp: at})
+		return session.DecideLogin(snapshot, session.LoginCommand{EventID: contractEvent1ID, SessionID: id, Key: key, Tags: tags, Timestamp: at})
 	})
 	if err != nil {
 		t.Fatalf("seed login error = %v", err)

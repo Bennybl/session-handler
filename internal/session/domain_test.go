@@ -98,6 +98,7 @@ func TestDecideLifecycle(t *testing.T) {
 	logoutAt := mustTime(t, "2026-08-21T12:00:00Z")
 
 	login, err := DecideLogin(CurrentSessionSnapshot{}, LoginCommand{
+		EventID:   eventIDLower,
 		SessionID: "session-1",
 		Key:       key,
 		Tags:      []string{"user"},
@@ -117,8 +118,9 @@ func TestDecideLifecycle(t *testing.T) {
 		t.Fatalf("initial states = %+v", started.Session.States)
 	}
 
-	loginSnapshot := CurrentSessionSnapshot{LastEventAt: timePointer(loginAt), Active: sessionPointer(started.Session)}
+	loginSnapshot := CurrentSessionSnapshot{LastEventAt: timePointer(loginAt), LastEventID: eventIDLower, Active: sessionPointer(started.Session)}
 	update, err := DecideUpdate(loginSnapshot, UpdateCommand{
+		EventID:   eventID2,
 		Key:       key,
 		Tags:      []string{"admin", "user"},
 		Timestamp: updateAt,
@@ -130,7 +132,7 @@ func TestDecideLifecycle(t *testing.T) {
 	if !ok {
 		t.Fatalf("update mutation = %T, want ReplaceState", update)
 	}
-	if replaced.SessionID != "session-1" || !replaced.CloseCurrentAt.Equal(updateAt) {
+	if replaced.EventID != eventID2 || replaced.SessionID != "session-1" || !replaced.CloseCurrentAt.Equal(updateAt) {
 		t.Fatalf("replace mutation = %+v", replaced)
 	}
 	if !reflect.DeepEqual(replaced.State.Tags, []string{"admin", "user"}) {
@@ -138,10 +140,12 @@ func TestDecideLifecycle(t *testing.T) {
 	}
 
 	activeAfterUpdate := started.Session
+	activeAfterUpdate.LastEventID = eventID2
 	activeAfterUpdate.States[0].ValidTo = timePointer(updateAt)
 	activeAfterUpdate.States = append(activeAfterUpdate.States, replaced.State)
-	updateSnapshot := CurrentSessionSnapshot{LastEventAt: timePointer(updateAt), Active: &activeAfterUpdate}
+	updateSnapshot := CurrentSessionSnapshot{LastEventAt: timePointer(updateAt), LastEventID: eventID2, Active: &activeAfterUpdate}
 	logout, err := DecideLogout(updateSnapshot, LogoutCommand{
+		EventID:   eventID3,
 		Key:       key,
 		Timestamp: logoutAt,
 	})
@@ -152,14 +156,15 @@ func TestDecideLifecycle(t *testing.T) {
 	if !ok {
 		t.Fatalf("logout mutation = %T, want EndSession", logout)
 	}
-	if ended.SessionID != "session-1" || !ended.LogoutAt.Equal(logoutAt) || !ended.CloseCurrentAt.Equal(logoutAt) {
+	if ended.EventID != eventID3 || ended.SessionID != "session-1" || !ended.LogoutAt.Equal(logoutAt) || !ended.CloseCurrentAt.Equal(logoutAt) {
 		t.Fatalf("end mutation = %+v", ended)
 	}
 
 	completed := activeAfterUpdate
 	completed.States[1].ValidTo = timePointer(logoutAt)
 	completed.LogoutAt = timePointer(logoutAt)
-	relogin, err := DecideLogin(CurrentSessionSnapshot{LastEventAt: timePointer(logoutAt)}, LoginCommand{
+	relogin, err := DecideLogin(CurrentSessionSnapshot{LastEventAt: timePointer(logoutAt), LastEventID: eventID3}, LoginCommand{
+		EventID:   eventID4,
 		SessionID: "session-2",
 		Key:       key,
 		Tags:      []string{"user"},
@@ -195,19 +200,19 @@ func TestDecideRejectsInvalidTransitionsWithoutMutatingSnapshot(t *testing.T) {
 			name:     "login while active",
 			snapshot: CurrentSessionSnapshot{Active: &active},
 			decide: func(snapshot CurrentSessionSnapshot) (Mutation, error) {
-				return DecideLogin(snapshot, LoginCommand{SessionID: "session-2", Key: key, Tags: []string{"user"}, Timestamp: at.Add(time.Minute)})
+				return DecideLogin(snapshot, LoginCommand{EventID: eventIDLower, SessionID: "session-2", Key: key, Tags: []string{"user"}, Timestamp: at.Add(time.Minute)})
 			},
 		},
 		{
 			name: "update while inactive",
 			decide: func(snapshot CurrentSessionSnapshot) (Mutation, error) {
-				return DecideUpdate(snapshot, UpdateCommand{Key: key, Tags: []string{"admin"}, Timestamp: at})
+				return DecideUpdate(snapshot, UpdateCommand{EventID: eventIDLower, Key: key, Tags: []string{"admin"}, Timestamp: at})
 			},
 		},
 		{
 			name: "logout while inactive",
 			decide: func(snapshot CurrentSessionSnapshot) (Mutation, error) {
-				return DecideLogout(snapshot, LogoutCommand{Key: key, Timestamp: at})
+				return DecideLogout(snapshot, LogoutCommand{EventID: eventIDLower, Key: key, Timestamp: at})
 			},
 		},
 	}
@@ -233,10 +238,10 @@ func TestDecideRejectsStaleAndAcceptsEqualTimestamp(t *testing.T) {
 	active := Session{ID: "session-1", Key: key, LoginAt: at, States: []SessionState{{Tags: []string{"user"}, ValidFrom: at}}}
 	snapshot := CurrentSessionSnapshot{LastEventAt: timePointer(at), Active: &active}
 
-	if _, err := DecideUpdate(snapshot, UpdateCommand{Key: key, Tags: []string{"admin"}, Timestamp: at.Add(-time.Nanosecond)}); !errors.Is(err, ErrStaleEvent) {
+	if _, err := DecideUpdate(snapshot, UpdateCommand{EventID: eventIDLower, Key: key, Tags: []string{"admin"}, Timestamp: at.Add(-time.Nanosecond)}); !errors.Is(err, ErrStaleEvent) {
 		t.Fatalf("stale error = %v, want ErrStaleEvent", err)
 	}
-	if _, err := DecideUpdate(snapshot, UpdateCommand{Key: key, Tags: []string{"admin"}, Timestamp: at}); err != nil {
+	if _, err := DecideUpdate(snapshot, UpdateCommand{EventID: eventIDLower, Key: key, Tags: []string{"admin"}, Timestamp: at}); err != nil {
 		t.Fatalf("equal timestamp error = %v", err)
 	}
 }

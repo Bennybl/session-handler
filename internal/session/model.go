@@ -50,11 +50,12 @@ func (k SessionKey) validate() error {
 }
 
 type Session struct {
-	ID       string
-	Key      SessionKey
-	LoginAt  time.Time
-	LogoutAt *time.Time
-	States   []SessionState
+	ID          string
+	Key         SessionKey
+	LoginAt     time.Time
+	LogoutAt    *time.Time
+	LastEventID string
+	States      []SessionState
 }
 
 type SessionState struct {
@@ -81,6 +82,7 @@ func NormalizeTags(tags []string) ([]string, error) {
 }
 
 type LoginCommand struct {
+	EventID   string
 	SessionID string
 	Key       SessionKey
 	Tags      []string
@@ -88,17 +90,20 @@ type LoginCommand struct {
 }
 
 type UpdateCommand struct {
+	EventID   string
 	Key       SessionKey
 	Tags      []string
 	Timestamp time.Time
 }
 
 type LogoutCommand struct {
+	EventID   string
 	Key       SessionKey
 	Timestamp time.Time
 }
 
 type CurrentSessionSnapshot struct {
 	LastEventAt *time.Time
+	LastEventID string
 	Active      *Session
 }

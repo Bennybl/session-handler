@@ -89,7 +89,7 @@ func TestQueryUsesOneMatchingStateAndLoadsCompleteHistory(t *testing.T) {
 	updateAt := loginAt.Add(time.Hour)
 	seedLogin(t, repo, key, firstSessionID, loginAt)
 	if err := repo.Mutate(ctx, key, func(snapshot session.CurrentSessionSnapshot) (session.Mutation, error) {
-		return session.DecideUpdate(snapshot, session.UpdateCommand{Key: key, Tags: []string{"admin"}, Timestamp: updateAt})
+		return session.DecideUpdate(snapshot, session.UpdateCommand{EventID: postgresUpdateEventID, Key: key, Tags: []string{"admin"}, Timestamp: updateAt})
 	}); err != nil {
 		t.Fatalf("seed update: %v", err)
 	}
@@ -132,7 +132,7 @@ func TestQueryPagesDistinctSessionsAcrossKeysetBoundaries(t *testing.T) {
 	bob := mustKey(t, "tenant-a", "bob", "192.0.2.10")
 	seedLogin(t, repo, alice, firstSessionID, loginAt)
 	if err := repo.Mutate(ctx, alice, func(snapshot session.CurrentSessionSnapshot) (session.Mutation, error) {
-		return session.DecideUpdate(snapshot, session.UpdateCommand{Key: alice, Tags: []string{"user"}, Timestamp: updateAt})
+		return session.DecideUpdate(snapshot, session.UpdateCommand{EventID: postgresUpdateEventID, Key: alice, Tags: []string{"user"}, Timestamp: updateAt})
 	}); err != nil {
 		t.Fatalf("seed Alice update: %v", err)
 	}

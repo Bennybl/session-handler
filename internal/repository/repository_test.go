@@ -14,7 +14,7 @@ func TestMutationFuncUsesDomainSnapshotAndTypedMutation(t *testing.T) {
 
 	at := time.Date(2026, 8, 21, 10, 0, 0, 0, time.UTC)
 	snapshot := session.CurrentSessionSnapshot{LastEventAt: &at}
-	want := session.EndSession{SessionID: "session-1", CloseCurrentAt: at, LogoutAt: at}
+	want := session.EndSession{EventID: "40000000-0000-4000-8000-000000000001", SessionID: "session-1", CloseCurrentAt: at, LogoutAt: at}
 
 	fn := MutationFunc(func(got session.CurrentSessionSnapshot) (session.Mutation, error) {
 		if got.LastEventAt == nil || !got.LastEventAt.Equal(at) {
