@@ -46,3 +46,11 @@ implementing the assignment.
     add the in-memory repository using atomic locked mutations, isolated copies,
     declarative generic predicates, same-state temporal/tag matching, stable
     cursor pagination, complete histories, and concurrency coverage.
+18. After Step 4 was approved and merged, implement only Step 5 with tests first:
+    add a transactional embedded PostgreSQL migration runner, the session-key,
+    lifecycle, and state schema with generated ranges and indexes, identity and
+    active-lifecycle constraints, and a Compose-managed PostgreSQL service.
+19. Revise the PostgreSQL design to remove the `session_keys` domain table. Keep
+    only `sessions` and `session_states`, and serialize mutations using a
+    transaction-scoped advisory lock derived from `(tenantId, username, ip)`
+    before locking and reading matching session rows.
