@@ -58,7 +58,15 @@ func OpenNATSSource(ctx context.Context, url string, config NATSConfig) (*NATSSo
 	if strings.TrimSpace(url) == "" {
 		return nil, fmt.Errorf("%w: NATS URL is required", session.ErrInvalidInput)
 	}
-	connection, err := nats.Connect(url, nats.Name("session-handler"))
+	connectOptions := []nats.Option{nats.Name("session-handler")}
+	if deadline, exists := ctx.Deadline(); exists {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return nil, context.DeadlineExceeded
+		}
+		connectOptions = append(connectOptions, nats.Timeout(remaining))
+	}
+	connection, err := nats.Connect(url, connectOptions...)
 	if err != nil {
 		return nil, fmt.Errorf("connect to NATS: %w", err)
 	}
@@ -128,14 +136,16 @@ func (s *NATSSource) Next(ctx context.Context) (Message, error) {
 		consumer := s.consumer
 		maxWait := s.config.FetchMaxWait
 		s.mu.RUnlock()
-		message, err := consumer.Next(jetstream.FetchContext(ctx), jetstream.FetchMaxWait(maxWait))
+		fetchContext, cancelFetch := context.WithTimeout(ctx, maxWait)
+		message, err := consumer.Next(jetstream.FetchContext(fetchContext))
+		cancelFetch()
 		if err == nil {
 			return &jetStreamMessage{message: message}, nil
 		}
 		if contextError := ctx.Err(); contextError != nil {
 			return nil, contextError
 		}
-		if errors.Is(err, nats.ErrTimeout) || errors.Is(err, jetstream.ErrNoMessages) {
+		if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, nats.ErrTimeout) || errors.Is(err, jetstream.ErrNoMessages) {
 			continue
 		}
 		return nil, fmt.Errorf("fetch NATS event: %w", err)
