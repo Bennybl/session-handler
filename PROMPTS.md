@@ -24,3 +24,10 @@ implementing the assignment.
     field/operator/value query specifications backed by adapter registries.
 11. Begin implementation one step at a time and stop after each pull request for
     review.
+12. After Step 0 was approved and merged, implement only Step 1 using the strict
+    test-first cycle: write the session-domain tests, run and confirm the expected
+    failure, implement the minimum domain behavior, rerun until green, and open a
+    dedicated PR.
+13. Replace the generic event `Command` with typed `LoginCommand`,
+    `UpdateCommand`, and `LogoutCommand` inputs and separate decision functions;
+    make the change locally without pushing it yet.
