@@ -79,3 +79,7 @@ implementing the assignment.
     application service with test-first event dispatch, normalization, stable
     session UUID generation, duplicate handling, generic query forwarding,
     clock capture, cancellation, and error propagation.
+26. Start Step 10 locally without committing or pushing: add the test-first
+    transport-neutral consumer, stdin NDJSON source, durable NATS JetStream
+    source, explicit post-commit acknowledgements, delayed retry, dead lettering,
+    termination, bounded retention, and ordered one-message delivery.
