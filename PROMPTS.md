@@ -42,3 +42,7 @@ implementing the assignment.
 16. Before merging Step 3, make typed `IntervalValue` inputs use the same
     timestamp validation as map inputs: reject zero, equal, and reversed bounds,
     preserve open-ended intervals, and normalize accepted bounds to UTC.
+17. After Step 3 was approved and merged, implement only Step 4 with tests first:
+    add the in-memory repository using atomic locked mutations, isolated copies,
+    declarative generic predicates, same-state temporal/tag matching, stable
+    cursor pagination, complete histories, and concurrency coverage.
