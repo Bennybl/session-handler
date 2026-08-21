@@ -8,58 +8,49 @@ import (
 	"github.com/Bennybl/session-handler/internal/sessiontest"
 )
 
-func TestIntervalContainsUsesHalfOpenBounds(t *testing.T) {
-	t.Parallel()
-
-	from, to := sessiontest.At("10:00"), sessiontest.At("11:00")
-	interval := session.Interval{From: from, To: &to}
-
-	tests := []struct {
-		name string
-		at   time.Time
-		want bool
-	}{
-		{name: "before lower bound", at: from.Add(-time.Nanosecond), want: false},
-		{name: "at lower bound", at: from, want: true},
-		{name: "before upper bound", at: to.Add(-time.Nanosecond), want: true},
-		{name: "at upper bound", at: to, want: false},
-	}
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			t.Parallel()
-			if got := interval.Contains(test.at); got != test.want {
-				t.Fatalf("Contains(%v) = %v, want %v", test.at, got, test.want)
-			}
-		})
-	}
-}
-
-func TestIntervalOverlapUsesHalfOpenBoundsAndSupportsOpenRanges(t *testing.T) {
+// Intervals are half-open: they include their lower bound and exclude their
+// upper one, both when testing a point and when overlapping an open-ended range.
+func TestIntervalHalfOpenBoundsAndOverlap(t *testing.T) {
 	t.Parallel()
 
 	ten, eleven, twelve := sessiontest.At("10:00"), sessiontest.At("11:00"), sessiontest.At("12:00")
 	interval := session.Interval{From: ten, To: &eleven}
 
-	tests := []struct {
+	contains := []struct {
+		name string
+		at   time.Time
+		want bool
+	}{
+		{name: "before the lower bound", at: ten.Add(-time.Nanosecond), want: false},
+		{name: "at the lower bound", at: ten, want: true},
+		{name: "before the upper bound", at: eleven.Add(-time.Nanosecond), want: true},
+		{name: "at the upper bound", at: eleven, want: false},
+	}
+	for _, test := range contains {
+		if got := interval.Contains(test.at); got != test.want {
+			t.Errorf("%s: Contains(%v) = %v, want %v", test.name, test.at, got, test.want)
+		}
+	}
+
+	overlaps := []struct {
 		name  string
 		query session.TimeRange
 		want  bool
 	}{
 		{name: "overlapping range", query: timeRange(ten.Add(30*time.Minute), twelve), want: true},
-		{name: "starting at the upper bound", query: timeRange(eleven, twelve), want: false},
-		{name: "open before", query: session.TimeRange{To: sessiontest.Ptr(ten.Add(time.Minute))}, want: true},
-		{name: "open after", query: session.TimeRange{From: sessiontest.Ptr(ten.Add(time.Minute))}, want: true},
+		{name: "range starting at the upper bound", query: timeRange(eleven, twelve), want: false},
+		{name: "range open before", query: session.TimeRange{To: sessiontest.Ptr(ten.Add(time.Minute))}, want: true},
+		{name: "range open after", query: session.TimeRange{From: sessiontest.Ptr(ten.Add(time.Minute))}, want: true},
 	}
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			t.Parallel()
-			if got := interval.Overlaps(test.query); got != test.want {
-				t.Fatalf("Overlaps(%+v) = %v, want %v", test.query, got, test.want)
-			}
-		})
+	for _, test := range overlaps {
+		if got := interval.Overlaps(test.query); got != test.want {
+			t.Errorf("%s: Overlaps(%+v) = %v, want %v", test.name, test.query, got, test.want)
+		}
 	}
 }
 
+// A query is filters plus a page, carries the instant it is evaluated at, and
+// answers with sessions and an optional cursor.
 func TestGenericQueryAndPaginationTypes(t *testing.T) {
 	t.Parallel()
 

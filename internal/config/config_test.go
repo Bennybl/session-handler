@@ -6,8 +6,9 @@ import (
 )
 
 // With nothing configured the service runs the zero-dependency mode: an
-// in-memory store fed by stdin.
-func TestLoadDefaultsToMemoryStdin(t *testing.T) {
+// in-memory store fed by stdin. Explicit settings override every default, and
+// driver names are trimmed and case-insensitive.
+func TestLoadResolvesDefaultAndExplicitConfiguration(t *testing.T) {
 	t.Parallel()
 
 	got, err := FromLookup(mapLookup(nil))
@@ -22,16 +23,10 @@ func TestLoadDefaultsToMemoryStdin(t *testing.T) {
 		StartupTimeout:        10 * time.Second, ShutdownTimeout: 10 * time.Second,
 	}
 	if got != want {
-		t.Fatalf("FromLookup() = %+v, want %+v", got, want)
+		t.Errorf("default configuration = %+v, want %+v", got, want)
 	}
-}
 
-// Driver names are trimmed and case-insensitive, and every setting is read from
-// its documented environment variable.
-func TestLoadExplicitPostgresNATSConfiguration(t *testing.T) {
-	t.Parallel()
-
-	got, err := FromLookup(mapLookup(map[string]string{
+	got, err = FromLookup(mapLookup(map[string]string{
 		"SESSION_STORAGE": " POSTGRES ", "DATABASE_URL": "postgres://database/session",
 		"EVENT_STREAM_DRIVER": " NATS ", "NATS_URL": "nats://broker:4222",
 		"NATS_STREAM": "CUSTOM_EVENTS", "NATS_SUBJECT": "custom.events",
@@ -42,7 +37,7 @@ func TestLoadExplicitPostgresNATSConfiguration(t *testing.T) {
 		t.Fatalf("FromLookup() error = %v", err)
 	}
 
-	want := Config{
+	want = Config{
 		StorageDriver: StoragePostgres, DatabaseURL: "postgres://database/session",
 		EventStreamDriver: EventStreamNATS, NATSURL: "nats://broker:4222",
 		NATSStream: "CUSTOM_EVENTS", NATSSubject: "custom.events", NATSConsumer: "custom-handler",
@@ -50,7 +45,7 @@ func TestLoadExplicitPostgresNATSConfiguration(t *testing.T) {
 		StartupTimeout: 3 * time.Second, ShutdownTimeout: 4 * time.Second,
 	}
 	if got != want {
-		t.Fatalf("FromLookup() = %+v, want %+v", got, want)
+		t.Errorf("explicit configuration = %+v, want %+v", got, want)
 	}
 }
 
@@ -74,12 +69,9 @@ func TestLoadRejectsInvalidDriversMissingURLsAndTimeouts(t *testing.T) {
 	}
 
 	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			t.Parallel()
-			if _, err := FromLookup(mapLookup(test.values)); err == nil {
-				t.Fatal("FromLookup() error = nil, want a configuration error")
-			}
-		})
+		if _, err := FromLookup(mapLookup(test.values)); err == nil {
+			t.Errorf("%s: FromLookup() error = nil, want a configuration error", test.name)
+		}
 	}
 }
 

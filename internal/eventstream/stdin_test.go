@@ -13,8 +13,9 @@ import (
 )
 
 // The stdin source reads newline-delimited JSON, skips blank lines, and reports
-// a clean end of input rather than an error.
-func TestStdinSourceReadsNDJSONAndEndsCleanly(t *testing.T) {
+// a clean end of input. An envelope that is malformed, carries an unknown field,
+// or has trailing content is refused rather than half-decoded.
+func TestStdinSourceReadsNDJSONAndRejectsMalformedEnvelopes(t *testing.T) {
 	t.Parallel()
 
 	line := string(validEventJSON())
@@ -36,19 +37,14 @@ func TestStdinSourceReadsNDJSONAndEndsCleanly(t *testing.T) {
 			t.Fatalf("message %d = %+v, want a login carrying %q", index, event, streamEventID)
 		}
 	}
-
 	if _, err := source.Next(context.Background()); !errors.Is(err, io.EOF) {
 		t.Errorf("Next() after the last line = %v, want io.EOF", err)
 	}
 	if err := source.Close(); err != nil {
 		t.Errorf("Close() error = %v", err)
 	}
-}
 
-func TestDecodeEventRejectsMalformedAndUnknownJSON(t *testing.T) {
-	t.Parallel()
-
-	tests := []struct {
+	malformed := []struct {
 		name string
 		data []byte
 	}{
@@ -56,51 +52,42 @@ func TestDecodeEventRejectsMalformedAndUnknownJSON(t *testing.T) {
 		{name: "unknown field", data: []byte(`{"eventId":"` + streamEventID + `","type":"LOGIN","unknown":true}`)},
 		{name: "trailing value", data: append(validEventJSON(), []byte(` {}`)...)},
 	}
-
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			t.Parallel()
-			if _, err := DecodeEvent(test.data); !errors.Is(err, session.ErrInvalidInput) {
-				t.Fatalf("DecodeEvent(%q) error = %v, want ErrInvalidInput", test.data, err)
-			}
-		})
+	for _, test := range malformed {
+		if _, err := DecodeEvent(test.data); !errors.Is(err, session.ErrInvalidInput) {
+			t.Errorf("%s: DecodeEvent() error = %v, want ErrInvalidInput", test.name, err)
+		}
 	}
 }
 
-func TestStdinSourceHonorsPreCancelledContext(t *testing.T) {
+// Cancellation stops the source whether it arrives before the read or while the
+// read is already blocked on an idle pipe, so shutdown never waits for input
+// that will not come.
+func TestStdinSourceHonorsCancellation(t *testing.T) {
 	t.Parallel()
 
 	source, err := NewStdinSource(strings.NewReader(string(validEventJSON())))
 	if err != nil {
 		t.Fatalf("NewStdinSource() error = %v", err)
 	}
-	ctx, cancel := context.WithCancel(context.Background())
+	cancelled, cancel := context.WithCancel(context.Background())
 	cancel()
-
-	if _, err := source.Next(ctx); !errors.Is(err, context.Canceled) {
-		t.Fatalf("Next() error = %v, want context.Canceled", err)
+	if _, err := source.Next(cancelled); !errors.Is(err, context.Canceled) {
+		t.Errorf("Next() with a cancelled context = %v, want context.Canceled", err)
 	}
-}
-
-// A read already blocked on an idle pipe must still stop when the context ends,
-// so shutdown does not wait for input that never arrives.
-func TestStdinSourceCancellationInterruptsClosableReader(t *testing.T) {
-	t.Parallel()
 
 	reader, writer := io.Pipe()
 	t.Cleanup(func() { _ = writer.Close() })
-	source, err := NewStdinSource(reader)
+	blocked, err := NewStdinSource(reader)
 	if err != nil {
 		t.Fatalf("NewStdinSource() error = %v", err)
 	}
-
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, stop := context.WithCancel(context.Background())
 	result := make(chan error, 1)
 	go func() {
-		_, err := source.Next(ctx)
+		_, err := blocked.Next(ctx)
 		result <- err
 	}()
-	cancel()
+	stop()
 
 	select {
 	case err := <-result:

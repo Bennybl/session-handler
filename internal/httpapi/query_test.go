@@ -101,7 +101,7 @@ func TestQueryDecodesGenericSpecificationAndEncodesCompleteHistory(t *testing.T)
 	}
 }
 
-func TestQueryRejectsMalformedAndUnsupportedRequests(t *testing.T) {
+func TestQueryRejectsMalformedRequestsAndHidesUnexpectedFailures(t *testing.T) {
 	t.Parallel()
 
 	_, handler := newMemoryHandler(t, fixedClock(sessiontest.At("12:00")))
@@ -127,17 +127,44 @@ func TestQueryRejectsMalformedAndUnsupportedRequests(t *testing.T) {
 	}
 
 	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			response := postQuery(handler, test.body)
-			if response.Code != http.StatusBadRequest {
-				t.Fatalf("status = %d, want 400; body = %s", response.Code, response.Body.String())
-			}
-			var problem errorHTTPResponse
-			decodeJSON(t, response, &problem)
-			if problem.Error == "" {
-				t.Error("the error response carries no message")
-			}
-		})
+		response := postQuery(handler, test.body)
+		if response.Code != http.StatusBadRequest {
+			t.Errorf("%s: status = %d, want 400; body = %s", test.name, response.Code, response.Body.String())
+			continue
+		}
+		var problem errorHTTPResponse
+		decodeJSON(t, response, &problem)
+		if problem.Error == "" {
+			t.Errorf("%s: the error response carries no message", test.name)
+		}
+	}
+
+	// Queries are the only business route; events arrive through the stream.
+	queries := 0
+	counting := newHandler(t, queryServiceFunc(func(context.Context, service.QueryRequest) (session.QueryResult, error) {
+		queries++
+		return session.QueryResult{}, nil
+	}))
+	if got := request(counting, http.MethodPost, "/v1/sessions/events", `{}`); got.Code != http.StatusNotFound {
+		t.Errorf("POST /v1/sessions/events status = %d, want 404", got.Code)
+	}
+	if got := request(counting, http.MethodGet, queryPath, ""); got.Code != http.StatusMethodNotAllowed {
+		t.Errorf("GET %s status = %d, want 405", queryPath, got.Code)
+	}
+	if queries != 0 {
+		t.Errorf("query service calls = %d, want 0", queries)
+	}
+
+	// An unexpected failure is a 500 that reveals nothing about its cause.
+	failing := newHandler(t, queryServiceFunc(func(context.Context, service.QueryRequest) (session.QueryResult, error) {
+		return session.QueryResult{}, errors.New("database password must stay private")
+	}))
+	response := postQuery(failing, `{}`)
+	if response.Code != http.StatusInternalServerError {
+		t.Errorf("status = %d, want 500", response.Code)
+	}
+	if strings.Contains(response.Body.String(), "password") {
+		t.Errorf("response leaked the internal failure: %s", response.Body.String())
 	}
 }
 
@@ -183,43 +210,6 @@ func TestQueryCursorPinsTheEvaluationTime(t *testing.T) {
 	current := decodeQuery(t, handler, `{}`)
 	if len(current.Sessions) != 0 {
 		t.Fatalf("sessions active at %v = %+v, want none", currentTime, current.Sessions)
-	}
-}
-
-// Queries are the only business route; events arrive through the stream.
-func TestOnlyQueryBusinessRouteIsExposed(t *testing.T) {
-	t.Parallel()
-
-	queries := 0
-	handler := newHandler(t, queryServiceFunc(func(context.Context, service.QueryRequest) (session.QueryResult, error) {
-		queries++
-		return session.QueryResult{}, nil
-	}))
-
-	if got := request(handler, http.MethodPost, "/v1/sessions/events", `{}`); got.Code != http.StatusNotFound {
-		t.Errorf("POST /v1/sessions/events status = %d, want 404", got.Code)
-	}
-	if got := request(handler, http.MethodGet, queryPath, ""); got.Code != http.StatusMethodNotAllowed {
-		t.Errorf("GET %s status = %d, want 405", queryPath, got.Code)
-	}
-	if queries != 0 {
-		t.Errorf("query service calls = %d, want 0", queries)
-	}
-}
-
-func TestQueryMapsUnexpectedServiceFailureToInternalServerError(t *testing.T) {
-	t.Parallel()
-
-	handler := newHandler(t, queryServiceFunc(func(context.Context, service.QueryRequest) (session.QueryResult, error) {
-		return session.QueryResult{}, errors.New("database password must stay private")
-	}))
-
-	response := postQuery(handler, `{}`)
-	if response.Code != http.StatusInternalServerError {
-		t.Errorf("status = %d, want 500", response.Code)
-	}
-	if strings.Contains(response.Body.String(), "password") {
-		t.Errorf("response leaked the internal failure: %s", response.Body.String())
 	}
 }
 

@@ -25,19 +25,19 @@ var (
 	charlieID = sessiontest.SessionID(3)
 )
 
+// The complete shared adapter contract, including event-ID deduplication.
 func TestRepositoryContract(t *testing.T) {
 	repositorytest.Run(t, newRepository)
 }
 
-func TestEventIDContract(t *testing.T) {
-	repositorytest.EventIDCase().Run(t, newRepository)
-}
-
-func TestEveryRegisteredFilterAndOperator(t *testing.T) {
+// Every registered field and operator resolves against real stored data, all
+// state-scoped filters in one query must be satisfied by the same state, and a
+// match returns the session's complete history.
+func TestQueryFiltersOperatorsAndHistory(t *testing.T) {
 	t.Parallel()
 
 	repo := newFilterFixture(t)
-	tests := []struct {
+	filters := []struct {
 		name    string
 		filter  session.Filter
 		wantIDs []string
@@ -61,46 +61,55 @@ func TestEveryRegisteredFilterAndOperator(t *testing.T) {
 		{name: "login time less or equal", filter: sessiontest.Filter("loginTime", "lte", sessiontest.At("10:15")), wantIDs: []string{aliceID, bobID}},
 		{name: "login time between", filter: sessiontest.Filter("loginTime", "between", interval("10:10", "10:20")), wantIDs: []string{bobID}},
 	}
-
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			t.Parallel()
-			result := sessiontest.Query(t, repo, sessiontest.Spec(sessiontest.At("10:45"), test.filter))
-			if got := sortedIDs(result); !reflect.DeepEqual(got, test.wantIDs) {
-				t.Fatalf("matching sessions = %v, want %v", got, test.wantIDs)
-			}
-		})
+	for _, test := range filters {
+		result := sessiontest.Query(t, repo, sessiontest.Spec(sessiontest.At("10:45"), test.filter))
+		if got := sortedIDs(result); !reflect.DeepEqual(got, test.wantIDs) {
+			t.Errorf("%s: matching sessions = %v, want %v", test.name, got, test.wantIDs)
+		}
 	}
-}
-
-func TestStateFiltersMustMatchTheSameHistoricalState(t *testing.T) {
-	t.Parallel()
 
 	// Alice carried "user" until 10:30 and "admin" afterwards, so no single
 	// state is both active at 10:15 and tagged admin.
-	repo := newFilterFixture(t)
-	result := sessiontest.Query(t, repo, sessiontest.Spec(sessiontest.At("10:45"),
+	acrossStates := sessiontest.Query(t, repo, sessiontest.Spec(sessiontest.At("10:45"),
 		sessiontest.Filter("sessionId", "eq", aliceID),
 		sessiontest.Filter("activity", "at", sessiontest.At("10:15")),
 		sessiontest.Filter("tags", "containsAll", []string{"admin"}),
 	))
+	if len(acrossStates.Sessions) != 0 {
+		t.Errorf("matching sessions = %+v, want none; the filters matched different states", acrossStates.Sessions)
+	}
 
-	if len(result.Sessions) != 0 {
-		t.Fatalf("matching sessions = %+v, want none; the filters matched different states", result.Sessions)
+	// One matching state selects the session; the response carries all of them.
+	matched := sessiontest.Query(t, repo, sessiontest.Spec(sessiontest.At("12:00"),
+		sessiontest.Filter("sessionId", "eq", aliceID),
+		sessiontest.Filter("activity", "overlaps", interval("10:00", "11:00")),
+	))
+	if len(matched.Sessions) != 1 {
+		t.Fatalf("matching sessions = %+v, want only Alice", matched.Sessions)
+	}
+	alice := matched.Sessions[0]
+	if alice.LogoutAt == nil || !alice.LogoutAt.Equal(sessiontest.At("11:00")) {
+		t.Errorf("LogoutAt = %v, want 11:00", alice.LogoutAt)
+	}
+	if len(alice.States) != 2 {
+		t.Fatalf("states = %+v, want the complete two-state history", alice.States)
+	}
+	if alice.States[0].ValidTo == nil || !alice.States[0].ValidTo.Equal(sessiontest.At("10:30")) {
+		t.Errorf("first state ended at %v, want 10:30", alice.States[0].ValidTo)
 	}
 }
 
+// A cursor pins the instant the first page was evaluated at, so later pages stay
+// consistent even when every session has logged out by the time they are asked
+// for.
 func TestQueryCursorPinsTheDefaultActivityTime(t *testing.T) {
 	t.Parallel()
 
-	// Both sessions are active at 10:15 but logged out by 10:30, so the second
-	// page is only reachable if the cursor keeps the first page's "now".
 	repo := newRepository(t)
-	loginAt, logoutAt := sessiontest.At("10:00"), sessiontest.At("10:30")
 	for index, username := range []string{"alice", "bob"} {
 		key := sessiontest.Key("tenant-a", username, fmt.Sprintf("192.0.2.%d", index+10))
-		sessiontest.Login(t, repo, key, sessiontest.SessionID(index+1), loginAt, "user")
-		sessiontest.Logout(t, repo, key, logoutAt)
+		sessiontest.Login(t, repo, key, sessiontest.SessionID(index+1), sessiontest.At("10:00"), "user")
+		sessiontest.Logout(t, repo, key, sessiontest.At("10:30"))
 	}
 
 	first := sessiontest.Query(t, repo, session.QuerySpec{
@@ -119,36 +128,13 @@ func TestQueryCursorPinsTheDefaultActivityTime(t *testing.T) {
 		t.Fatalf("second page = %d sessions, cursor %q; want 1 session and no cursor", len(second.Sessions), second.NextCursor)
 	}
 	if first.Sessions[0].ID == second.Sessions[0].ID {
-		t.Fatalf("both pages returned session %q", first.Sessions[0].ID)
+		t.Errorf("both pages returned session %q", first.Sessions[0].ID)
 	}
 }
 
-func TestQueryLoadsCompleteIsolatedHistory(t *testing.T) {
-	t.Parallel()
-
-	repo := newFilterFixture(t)
-	result := sessiontest.Query(t, repo, sessiontest.Spec(sessiontest.At("12:00"),
-		sessiontest.Filter("sessionId", "eq", aliceID),
-		sessiontest.Filter("activity", "overlaps", interval("10:00", "11:00")),
-	))
-	if len(result.Sessions) != 1 {
-		t.Fatalf("matching sessions = %+v, want only Alice", result.Sessions)
-	}
-
-	// One matching state selects the session; the response carries all of them.
-	got := result.Sessions[0]
-	if got.LogoutAt == nil || !got.LogoutAt.Equal(sessiontest.At("11:00")) {
-		t.Errorf("LogoutAt = %v, want 11:00", got.LogoutAt)
-	}
-	if len(got.States) != 2 {
-		t.Fatalf("states = %+v, want the complete two-state history", got.States)
-	}
-	if got.States[0].ValidTo == nil || !got.States[0].ValidTo.Equal(sessiontest.At("10:30")) {
-		t.Errorf("first state ended at %v, want 10:30", got.States[0].ValidTo)
-	}
-}
-
-func TestConcurrentMutationAndQueries(t *testing.T) {
+// Mutations and queries run together without racing, and a closed store refuses
+// both rather than serving stale data.
+func TestConcurrentAccessAndClosedRepository(t *testing.T) {
 	repo := newRepository(t)
 	at := sessiontest.At("10:00")
 	keys := make([]session.SessionKey, 8)
@@ -186,31 +172,25 @@ func TestConcurrentMutationAndQueries(t *testing.T) {
 			}
 		}()
 	}
-
 	wait.Wait()
 	close(failures)
 	for err := range failures {
 		t.Errorf("concurrent operation error = %v", err)
 	}
-}
 
-func TestClosedRepositoryRejectsOperations(t *testing.T) {
-	t.Parallel()
-
-	repo := memory.New()
-	if err := repo.Close(); err != nil {
+	closed := memory.New()
+	if err := closed.Close(); err != nil {
 		t.Fatalf("Close() error = %v", err)
 	}
-
 	key := sessiontest.Key("tenant-a", "alice", "192.0.2.10")
-	mutateError := repo.Mutate(context.Background(), key, func(session.CurrentSessionSnapshot) (session.Mutation, error) {
+	mutateError := closed.Mutate(context.Background(), key, func(session.CurrentSessionSnapshot) (session.Mutation, error) {
 		return nil, nil
 	})
 	if !errors.Is(mutateError, repository.ErrClosed) {
-		t.Errorf("Mutate() error = %v, want ErrClosed", mutateError)
+		t.Errorf("Mutate() on a closed store = %v, want ErrClosed", mutateError)
 	}
-	if _, err := repo.Query(context.Background(), session.QuerySpec{EvaluatedAt: time.Now()}); !errors.Is(err, repository.ErrClosed) {
-		t.Errorf("Query() error = %v, want ErrClosed", err)
+	if _, err := closed.Query(context.Background(), session.QuerySpec{EvaluatedAt: at}); !errors.Is(err, repository.ErrClosed) {
+		t.Errorf("Query() on a closed store = %v, want ErrClosed", err)
 	}
 }
 
@@ -244,7 +224,7 @@ func interval(from, to string) query.IntervalValue {
 }
 
 // sortedIDs returns the matching session IDs in a stable order, because these
-// tests assert which sessions matched rather than how they were ordered.
+// checks assert which sessions matched rather than how they were ordered.
 func sortedIDs(result session.QueryResult) []string {
 	ids := sessiontest.SessionIDs(result)
 	sort.Strings(ids)

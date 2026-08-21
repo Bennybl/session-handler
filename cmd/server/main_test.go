@@ -49,20 +49,19 @@ func TestRunSelectsConfiguredAdapters(t *testing.T) {
 	}
 
 	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			t.Parallel()
+		func() {
 			spy := &runtimeSpy{}
 			server := newFakeServer()
 			runUntilCancelled(t, test.configuration, spy.dependencies(&fakeRepository{}, newBlockingSource(), server), server)
 
 			if !reflect.DeepEqual(spy.built, test.wantBuilt) {
-				t.Fatalf("adapters built = %v, want %v", spy.built, test.wantBuilt)
+				t.Errorf("%s: adapters built = %v, want %v", test.name, spy.built, test.wantBuilt)
 			}
 			if spy.databaseURL != test.configuration.DatabaseURL {
-				t.Errorf("database URL = %q, want %q", spy.databaseURL, test.configuration.DatabaseURL)
+				t.Errorf("%s: database URL = %q, want %q", test.name, spy.databaseURL, test.configuration.DatabaseURL)
 			}
 			if spy.natsURL != test.configuration.NATSURL {
-				t.Errorf("NATS URL = %q, want %q", spy.natsURL, test.configuration.NATSURL)
+				t.Errorf("%s: NATS URL = %q, want %q", test.name, spy.natsURL, test.configuration.NATSURL)
 			}
 			if test.configuration.EventStreamDriver != appconfig.EventStreamNATS {
 				return
@@ -80,16 +79,41 @@ func TestRunSelectsConfiguredAdapters(t *testing.T) {
 				DeadLetterSubject: spy.natsConfig.DeadLetterSubject,
 			}
 			if got != want {
-				t.Errorf("NATS stream settings = %+v, want %+v", got, want)
+				t.Errorf("%s: NATS stream settings = %+v, want %+v", test.name, got, want)
 			}
-		})
+		}()
 	}
 }
 
-// While running, the process reports ready and serves queries only. Cancelling
-// shuts the consumer, repository, and server down, and readiness turns off.
-func TestRunReadinessAndGracefulShutdown(t *testing.T) {
+// While running, the process reports ready and serves queries only. Piped input
+// ending does not stop it. Cancelling shuts the consumer, repository, and server
+// down, and readiness turns off.
+func TestRunReadinessStdinEOFAndGracefulShutdown(t *testing.T) {
 	t.Parallel()
+
+	// Stdin reaching EOF must leave the query server serving.
+	endedSource := &fakeSource{eof: true, cancelled: make(chan struct{})}
+	endedServer := newFakeServer()
+	endedSpy := &runtimeSpy{}
+	endedCtx, stopEnded := context.WithCancel(context.Background())
+	endedResult := make(chan error, 1)
+	go func() {
+		endedResult <- run(endedCtx, runtimeConfig(appconfig.StorageMemory, appconfig.EventStreamStdin),
+			endedSpy.dependencies(&fakeRepository{}, endedSource, endedServer))
+	}()
+	sessiontest.Await(t, endedServer.started, "the HTTP server to start")
+	select {
+	case err := <-endedResult:
+		t.Fatalf("run() returned at stdin EOF: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	if got := requestStatus(endedServer.handler, http.MethodGet, "/readyz"); got != http.StatusOK {
+		t.Errorf("readiness after stdin EOF = %d, want 200", got)
+	}
+	stopEnded()
+	if err := waitResult(t, endedResult); err != nil {
+		t.Fatalf("run() error after stdin EOF = %v", err)
+	}
 
 	repo := &fakeRepository{}
 	source := newBlockingSource()
@@ -127,35 +151,6 @@ func TestRunReadinessAndGracefulShutdown(t *testing.T) {
 	}
 	if got := requestStatus(server.handler, http.MethodGet, "/readyz"); got != http.StatusServiceUnavailable {
 		t.Errorf("readiness after shutdown = %d, want 503", got)
-	}
-}
-
-// Piped input ends, but the query API must keep serving what was ingested.
-func TestRunStdinEOFLeavesQueryServerRunning(t *testing.T) {
-	t.Parallel()
-
-	source := &fakeSource{eof: true, cancelled: make(chan struct{})}
-	server := newFakeServer()
-	spy := &runtimeSpy{}
-	configuration := runtimeConfig(appconfig.StorageMemory, appconfig.EventStreamStdin)
-
-	ctx, cancel := context.WithCancel(context.Background())
-	result := make(chan error, 1)
-	go func() { result <- run(ctx, configuration, spy.dependencies(&fakeRepository{}, source, server)) }()
-	sessiontest.Await(t, server.started, "the HTTP server to start")
-
-	select {
-	case err := <-result:
-		t.Fatalf("run() returned at stdin EOF: %v", err)
-	case <-time.After(50 * time.Millisecond):
-	}
-	if got := requestStatus(server.handler, http.MethodGet, "/readyz"); got != http.StatusOK {
-		t.Errorf("readiness after stdin EOF = %d, want 200", got)
-	}
-
-	cancel()
-	if err := waitResult(t, result); err != nil {
-		t.Fatalf("run() error = %v", err)
 	}
 }
 

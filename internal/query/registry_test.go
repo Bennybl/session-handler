@@ -11,6 +11,10 @@ import (
 	"github.com/Bennybl/session-handler/internal/sessiontest"
 )
 
+// A registered filter is resolved to its handler and scope, and its value is
+// normalized: IPs canonicalized, tag lists deduplicated and sorted, timestamps
+// and intervals converted to UTC. Interval values are validated the same way
+// whether they arrive as a typed value or as decoded JSON.
 func TestRegistryResolvesAndNormalizesFilters(t *testing.T) {
 	t.Parallel()
 
@@ -56,72 +60,13 @@ func TestRegistryResolvesAndNormalizesFilters(t *testing.T) {
 		!equalOptionalTime(interval.To, sessiontest.Ptr(sessiontest.At("12:00"))) {
 		t.Errorf("normalized interval = %+v, want 10:00Z to 12:00Z", interval)
 	}
-}
 
-func TestRegistryRejectsInvalidDefinitions(t *testing.T) {
-	t.Parallel()
-
-	tests := []struct {
-		name    string
-		entries []Entry[string]
-	}{
-		{name: "empty field", entries: []Entry[string]{{Operator: "eq", Scope: ScopeSession, ValueKind: ValueString}}},
-		{name: "empty operator", entries: []Entry[string]{{Field: "tenantId", Scope: ScopeSession, ValueKind: ValueString}}},
-		{name: "invalid scope", entries: []Entry[string]{{Field: "tenantId", Operator: "eq", Scope: Scope("other"), ValueKind: ValueString}}},
-		{name: "invalid value kind", entries: []Entry[string]{{Field: "tenantId", Operator: "eq", Scope: ScopeSession, ValueKind: ValueKind("other")}}},
-		{name: "duplicate entry", entries: []Entry[string]{
-			{Field: "tenantId", Operator: "eq", Scope: ScopeSession, ValueKind: ValueString},
-			{Field: "tenantId", Operator: "eq", Scope: ScopeSession, ValueKind: ValueString},
-		}},
-	}
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			t.Parallel()
-			if _, err := NewRegistry(test.entries); !errors.Is(err, repository.ErrInvalidQuery) {
-				t.Fatalf("NewRegistry() error = %v, want ErrInvalidQuery", err)
-			}
-		})
-	}
-}
-
-func TestRegistryRejectsUnregisteredAndInvalidFilters(t *testing.T) {
-	t.Parallel()
-
-	registry := mustRegistry(t, []Entry[string]{
-		{Field: "tenantId", Operator: "eq", Scope: ScopeSession, ValueKind: ValueString},
-	})
-
-	tests := []struct {
-		name   string
-		filter session.Filter
-	}{
-		{name: "unregistered field", filter: sessiontest.Filter("unknown", "eq", "value")},
-		{name: "unregistered operator", filter: sessiontest.Filter("tenantId", "in", []string{"tenant-a"})},
-		{name: "empty value", filter: sessiontest.Filter("tenantId", "eq", "")},
-	}
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			t.Parallel()
-			if _, err := registry.Resolve([]session.Filter{test.filter}); !errors.Is(err, repository.ErrInvalidQuery) {
-				t.Fatalf("Resolve() error = %v, want ErrInvalidQuery", err)
-			}
-		})
-	}
-}
-
-func TestIntervalValueSharesTimestampValidationWithMapInput(t *testing.T) {
-	t.Parallel()
-
-	registry := mustRegistry(t, []Entry[string]{
-		{Field: "activity", Operator: "overlaps", Scope: ScopeState, ValueKind: ValueInterval},
-	})
-	// The bounds carry a zone offset so the test also covers conversion to UTC.
+	// The same rules apply to an interval supplied as a typed value. Its bounds
+	// carry a zone offset, so this also covers conversion to UTC.
 	zone := time.FixedZone("UTC+3", 3*60*60)
-	from := sessiontest.At("07:00").In(zone)
-	to := sessiontest.At("09:00").In(zone)
+	from, to := sessiontest.At("07:00").In(zone), sessiontest.At("09:00").In(zone)
 	zero := time.Time{}
-
-	tests := []struct {
+	intervals := []struct {
 		name      string
 		value     IntervalValue
 		wantError bool
@@ -135,28 +80,71 @@ func TestIntervalValueSharesTimestampValidationWithMapInput(t *testing.T) {
 		{name: "open ended from", value: IntervalValue{From: &from}, wantFrom: sessiontest.Ptr(sessiontest.At("07:00"))},
 		{name: "open ended to", value: IntervalValue{To: &to}, wantTo: sessiontest.Ptr(sessiontest.At("09:00"))},
 	}
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			t.Parallel()
-			resolved, err := registry.Resolve([]session.Filter{sessiontest.Filter("activity", "overlaps", test.value)})
-			if test.wantError {
-				if !errors.Is(err, repository.ErrInvalidQuery) {
-					t.Fatalf("Resolve() error = %v, want ErrInvalidQuery", err)
-				}
-				return
+	for _, test := range intervals {
+		got, err := registry.Resolve([]session.Filter{sessiontest.Filter("activity", "overlaps", test.value)})
+		if test.wantError {
+			if !errors.Is(err, repository.ErrInvalidQuery) {
+				t.Errorf("%s: Resolve() error = %v, want ErrInvalidQuery", test.name, err)
 			}
-			if err != nil {
-				t.Fatalf("Resolve() error = %v", err)
-			}
-			got := resolved[0].Value.(IntervalValue)
-			if !equalOptionalTime(got.From, test.wantFrom) || !equalOptionalTime(got.To, test.wantTo) {
-				t.Fatalf("normalized interval = %+v, want from %v to %v", got, test.wantFrom, test.wantTo)
-			}
-		})
+			continue
+		}
+		if err != nil {
+			t.Errorf("%s: Resolve() error = %v", test.name, err)
+			continue
+		}
+		value := got[0].Value.(IntervalValue)
+		if !equalOptionalTime(value.From, test.wantFrom) || !equalOptionalTime(value.To, test.wantTo) {
+			t.Errorf("%s: normalized interval = %+v, want from %v to %v", test.name, value, test.wantFrom, test.wantTo)
+		}
 	}
 }
 
-func TestPrepareAppliesLimitsAndStableFingerprint(t *testing.T) {
+// A registry refuses definitions it cannot serve, and refuses filters naming a
+// field or operator it does not carry.
+func TestRegistryRejectsInvalidDefinitionsAndFilters(t *testing.T) {
+	t.Parallel()
+
+	definitions := []struct {
+		name    string
+		entries []Entry[string]
+	}{
+		{name: "empty field", entries: []Entry[string]{{Operator: "eq", Scope: ScopeSession, ValueKind: ValueString}}},
+		{name: "empty operator", entries: []Entry[string]{{Field: "tenantId", Scope: ScopeSession, ValueKind: ValueString}}},
+		{name: "invalid scope", entries: []Entry[string]{{Field: "tenantId", Operator: "eq", Scope: Scope("other"), ValueKind: ValueString}}},
+		{name: "invalid value kind", entries: []Entry[string]{{Field: "tenantId", Operator: "eq", Scope: ScopeSession, ValueKind: ValueKind("other")}}},
+		{name: "duplicate entry", entries: []Entry[string]{
+			{Field: "tenantId", Operator: "eq", Scope: ScopeSession, ValueKind: ValueString},
+			{Field: "tenantId", Operator: "eq", Scope: ScopeSession, ValueKind: ValueString},
+		}},
+	}
+	for _, test := range definitions {
+		if _, err := NewRegistry(test.entries); !errors.Is(err, repository.ErrInvalidQuery) {
+			t.Errorf("%s: NewRegistry() error = %v, want ErrInvalidQuery", test.name, err)
+		}
+	}
+
+	registry := mustRegistry(t, []Entry[string]{
+		{Field: "tenantId", Operator: "eq", Scope: ScopeSession, ValueKind: ValueString},
+	})
+	filters := []struct {
+		name   string
+		filter session.Filter
+	}{
+		{name: "unregistered field", filter: sessiontest.Filter("unknown", "eq", "value")},
+		{name: "unregistered operator", filter: sessiontest.Filter("tenantId", "in", []string{"tenant-a"})},
+		{name: "empty value", filter: sessiontest.Filter("tenantId", "eq", "")},
+	}
+	for _, test := range filters {
+		if _, err := registry.Resolve([]session.Filter{test.filter}); !errors.Is(err, repository.ErrInvalidQuery) {
+			t.Errorf("%s: Resolve() error = %v, want ErrInvalidQuery", test.name, err)
+		}
+	}
+}
+
+// Preparing a query applies the default and maximum page limits, fingerprints
+// equivalent queries identically, and restores the evaluation time a cursor
+// carries so paging cannot drift as the clock advances.
+func TestPrepareLimitsFingerprintAndCursor(t *testing.T) {
 	t.Parallel()
 
 	registry := mustRegistry(t, []Entry[string]{
@@ -168,21 +156,18 @@ func TestPrepareAppliesLimitsAndStableFingerprint(t *testing.T) {
 
 	// The same query written in a different order, with tags listed in a
 	// different order, must fingerprint identically.
-	withDefaultLimit := session.QuerySpec{
+	first, err := Prepare(session.QuerySpec{
 		Filters:     []session.Filter{tenant, sessiontest.Filter("tags", "containsAll", []string{"user", "admin"})},
 		EvaluatedAt: evaluatedAt,
-	}
-	withMaximumLimit := session.QuerySpec{
-		Filters:     []session.Filter{sessiontest.Filter("tags", "containsAll", []string{"admin", "user"}), tenant},
-		Page:        session.PageRequest{Limit: MaxLimit},
-		EvaluatedAt: evaluatedAt,
-	}
-
-	first, err := Prepare(withDefaultLimit, "memory", registry)
+	}, "memory", registry)
 	if err != nil {
 		t.Fatalf("Prepare() error = %v", err)
 	}
-	second, err := Prepare(withMaximumLimit, "memory", registry)
+	second, err := Prepare(session.QuerySpec{
+		Filters:     []session.Filter{sessiontest.Filter("tags", "containsAll", []string{"admin", "user"}), tenant},
+		Page:        session.PageRequest{Limit: MaxLimit},
+		EvaluatedAt: evaluatedAt,
+	}, "memory", registry)
 	if err != nil {
 		t.Fatalf("Prepare() error = %v", err)
 	}
@@ -202,44 +187,27 @@ func TestPrepareAppliesLimitsAndStableFingerprint(t *testing.T) {
 			t.Errorf("Prepare(limit=%d) error = %v, want ErrInvalidQuery", limit, err)
 		}
 	}
-}
 
-func TestPrepareRestoresCursorEvaluationTime(t *testing.T) {
-	t.Parallel()
-
-	registry := mustRegistry(t, []Entry[string]{
-		{Field: "tenantId", Operator: "eq", Scope: ScopeSession, ValueKind: ValueString},
-	})
-	filters := []session.Filter{sessiontest.Filter("tenantId", "eq", "tenant-a")}
-	firstEvaluation := sessiontest.At("10:00")
 	after := SortKey{
 		TenantID: "tenant-a", Username: "alice", IP: "192.0.2.10",
-		LoginAt: firstEvaluation, SessionID: sessiontest.SessionID(1),
-	}
-
-	first, err := Prepare(session.QuerySpec{Filters: filters, EvaluatedAt: firstEvaluation}, "memory", registry)
-	if err != nil {
-		t.Fatalf("first Prepare() error = %v", err)
+		LoginAt: evaluatedAt, SessionID: sessiontest.SessionID(1),
 	}
 	cursor, err := EncodeCursor(Cursor{
-		Storage: "memory", Fingerprint: first.Fingerprint, EvaluatedAt: firstEvaluation, After: after,
+		Storage: "memory", Fingerprint: first.Fingerprint, EvaluatedAt: evaluatedAt, After: after,
 	})
 	if err != nil {
 		t.Fatalf("EncodeCursor() error = %v", err)
 	}
-
-	// An hour later the same query resumes at the cursor's evaluation time, so
-	// paging cannot drift as the default "now" advances.
 	next, err := Prepare(session.QuerySpec{
-		Filters:     filters,
+		Filters:     []session.Filter{tenant, sessiontest.Filter("tags", "containsAll", []string{"user", "admin"})},
 		Page:        session.PageRequest{Cursor: cursor},
-		EvaluatedAt: firstEvaluation.Add(time.Hour),
+		EvaluatedAt: evaluatedAt.Add(time.Hour),
 	}, "memory", registry)
 	if err != nil {
-		t.Fatalf("next Prepare() error = %v", err)
+		t.Fatalf("Prepare() with a cursor error = %v", err)
 	}
-	if !next.EvaluatedAt.Equal(firstEvaluation) {
-		t.Errorf("EvaluatedAt = %v, want the cursor's %v", next.EvaluatedAt, firstEvaluation)
+	if !next.EvaluatedAt.Equal(evaluatedAt) {
+		t.Errorf("EvaluatedAt = %v, want the cursor's %v", next.EvaluatedAt, evaluatedAt)
 	}
 	if next.After == nil || *next.After != after {
 		t.Errorf("After = %+v, want %+v", next.After, after)

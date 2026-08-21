@@ -60,11 +60,18 @@ func TestNATSCreatesBoundedStreamAndOrderedDurableConsumer(t *testing.T) {
 		t.Errorf("consumer MaxAckPending = %d, MaxRequestBatch = %d; want 1 and 1",
 			consumerConfig.MaxAckPending, consumerConfig.MaxRequestBatch)
 	}
+
+	// A cancelled context stops a fetch instead of waiting it out.
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := source.Next(cancelled); !errors.Is(err, context.Canceled) {
+		t.Errorf("Next() with a cancelled context = %v, want context.Canceled", err)
+	}
 }
 
 // Closing without acknowledging leaves the message on the stream, and a
 // restarted durable consumer receives it again.
-func TestNATSDurableConsumerRedeliversUnacknowledgedMessageAfterRestart(t *testing.T) {
+func TestNATSRedeliversUnacknowledgedMessagesAndPublishesDeadLetters(t *testing.T) {
 	config := testNATSConfig(t)
 	config.AckWait = 250 * time.Millisecond
 	source, _ := newNATSSource(t, config)
@@ -104,11 +111,10 @@ func TestNATSDurableConsumerRedeliversUnacknowledgedMessageAfterRestart(t *testi
 	if err := redelivered.Ack(ctx); err != nil {
 		t.Errorf("Ack() error = %v", err)
 	}
-}
 
-func TestNATSPublishesDeadLetterEnvelope(t *testing.T) {
-	source, config := newNATSSource(t, testNATSConfig(t))
-	connection := source.connection
+	// The same stream carries dead letters on their own subject. The first
+	// source is closed by now, so publish through the restarted one.
+	connection := restarted.connection
 	subscription, err := connection.SubscribeSync(config.DeadLetterSubject)
 	if err != nil {
 		t.Fatalf("SubscribeSync() error = %v", err)
@@ -122,7 +128,7 @@ func TestNATSPublishesDeadLetterEnvelope(t *testing.T) {
 		Reason:   "malformed",
 		FailedAt: sessiontest.At("10:00"),
 	}
-	if err := source.PublishDeadLetter(context.Background(), want); err != nil {
+	if err := restarted.PublishDeadLetter(ctx, want); err != nil {
 		t.Fatalf("PublishDeadLetter() error = %v", err)
 	}
 
@@ -136,16 +142,6 @@ func TestNATSPublishesDeadLetterEnvelope(t *testing.T) {
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("dead letter = %+v, want %+v", got, want)
-	}
-}
-
-func TestNATSNextHonorsCancellation(t *testing.T) {
-	source, _ := newNATSSource(t, testNATSConfig(t))
-	cancelled, cancel := context.WithCancel(context.Background())
-	cancel()
-
-	if _, err := source.Next(cancelled); !errors.Is(err, context.Canceled) {
-		t.Fatalf("Next() error = %v, want context.Canceled", err)
 	}
 }
 

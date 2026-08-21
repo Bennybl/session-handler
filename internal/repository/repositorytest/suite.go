@@ -44,12 +44,14 @@ func EventIDCase() Case {
 }
 
 // Run executes the complete contract against the repositories factory builds.
+// The cases share one test scope, so a failing requirement stops the rest. Each
+// requirement is logged before it runs, and the log is printed on failure, so
+// the last line names the requirement that broke.
 func Run(t *testing.T, factory Factory) {
 	t.Helper()
 	for _, contractCase := range Cases() {
-		t.Run(contractCase.Name, func(t *testing.T) {
-			contractCase.Run(t, factory)
-		})
+		t.Logf("contract requirement: %s", contractCase.Name)
+		contractCase.Run(t, factory)
 	}
 }
 
@@ -58,7 +60,8 @@ func Run(t *testing.T, factory Factory) {
 // from rolled-back ones.
 func testLifecycleSnapshots(t *testing.T, factory Factory) {
 	t.Helper()
-	repo := newRepository(t, factory)
+	repo, releaseRepo := newRepository(t, factory)
+	defer releaseRepo()
 	key := sessiontest.Key("tenant-a", "alice", "192.0.2.10")
 	loginAt, updateAt, logoutAt := sessiontest.At("10:00"), sessiontest.At("10:30"), sessiontest.At("12:00")
 	sessionID := sessiontest.SessionID(1)
@@ -94,7 +97,8 @@ func testLifecycleSnapshots(t *testing.T, factory Factory) {
 // given must be a copy it cannot write through.
 func testCallbackRollbackAndIsolation(t *testing.T, factory Factory) {
 	t.Helper()
-	repo := newRepository(t, factory)
+	repo, releaseRepo := newRepository(t, factory)
+	defer releaseRepo()
 	key := sessiontest.Key("tenant-a", "alice", "192.0.2.10")
 	sessiontest.Login(t, repo, key, sessiontest.SessionID(1), sessiontest.At("10:00"), "user")
 
@@ -117,7 +121,8 @@ func testCallbackRollbackAndIsolation(t *testing.T, factory Factory) {
 // each other.
 func testSameKeySerialization(t *testing.T, factory Factory) {
 	t.Helper()
-	repo := newRepository(t, factory)
+	repo, releaseRepo := newRepository(t, factory)
+	defer releaseRepo()
 	key := sessiontest.Key("tenant-a", "alice", "192.0.2.10")
 	rollback := errors.New("do not commit")
 	firstEntered, releaseFirst := make(chan struct{}), make(chan struct{})
@@ -158,7 +163,8 @@ func testSameKeySerialization(t *testing.T, factory Factory) {
 // that apply to the session combine with them.
 func testGenericStateScopedFilters(t *testing.T, factory Factory) {
 	t.Helper()
-	repo := newRepository(t, factory)
+	repo, releaseRepo := newRepository(t, factory)
+	defer releaseRepo()
 	at := sessiontest.At("10:00")
 	alice := sessiontest.Key("tenant-a", "alice", "192.0.2.10")
 	bob := sessiontest.Key("tenant-a", "bob", "192.0.2.10")
@@ -181,7 +187,8 @@ func testGenericStateScopedFilters(t *testing.T, factory Factory) {
 // last page reports no further cursor.
 func testPaginationAndStableCursors(t *testing.T, factory Factory) {
 	t.Helper()
-	repo := newRepository(t, factory)
+	repo, releaseRepo := newRepository(t, factory)
+	defer releaseRepo()
 	at := sessiontest.At("10:00")
 	for index, username := range []string{"alice", "bob", "charlie"} {
 		key := sessiontest.Key("tenant-a", username, "192.0.2.10")
@@ -209,7 +216,8 @@ func testPaginationAndStableCursors(t *testing.T, factory Factory) {
 // Query results are copies, so a caller cannot write into stored state.
 func testQueryResultIsolation(t *testing.T, factory Factory) {
 	t.Helper()
-	repo := newRepository(t, factory)
+	repo, releaseRepo := newRepository(t, factory)
+	defer releaseRepo()
 	at := sessiontest.At("10:00")
 	key := sessiontest.Key("tenant-a", "alice", "192.0.2.10")
 	sessiontest.Login(t, repo, key, sessiontest.SessionID(1), at, "user")
@@ -228,7 +236,8 @@ func testQueryResultIsolation(t *testing.T, factory Factory) {
 // belongs to, and replaying it is a successful no-op.
 func testEventIDAtomicityAndDeduplication(t *testing.T, factory Factory) {
 	t.Helper()
-	repo := newRepository(t, factory)
+	repo, releaseRepo := newRepository(t, factory)
+	defer releaseRepo()
 	key := sessiontest.Key("tenant-a", "alice", "192.0.2.10")
 	loginAt := sessiontest.At("10:00")
 	updateAt, logoutAt := loginAt.Add(time.Hour), loginAt.Add(2*time.Hour)
@@ -316,7 +325,10 @@ func assertEventIdentity(t *testing.T, snapshot session.CurrentSessionSnapshot, 
 	}
 }
 
-func newRepository(t *testing.T, factory Factory) repository.SessionRepository {
+// newRepository opens a store for one contract case. The caller must call the
+// returned release function before the next case runs, because the cases share
+// one test scope and an adapter may rebuild its storage on open.
+func newRepository(t *testing.T, factory Factory) (repository.SessionRepository, func()) {
 	t.Helper()
 	if factory == nil {
 		t.Fatal("repository contract factory is nil")
@@ -325,12 +337,11 @@ func newRepository(t *testing.T, factory Factory) repository.SessionRepository {
 	if repo == nil {
 		t.Fatal("repository contract factory returned nil")
 	}
-	t.Cleanup(func() {
+	return repo, func() {
 		if err := repo.Close(); err != nil && !errors.Is(err, repository.ErrClosed) {
 			t.Errorf("Close() error = %v", err)
 		}
-	})
-	return repo
+	}
 }
 
 func distinct(values []string) []string {

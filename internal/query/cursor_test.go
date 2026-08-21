@@ -12,13 +12,15 @@ import (
 	"github.com/Bennybl/session-handler/internal/sessiontest"
 )
 
-func TestCursorRoundTrip(t *testing.T) {
+// A cursor survives a round trip, and is refused when it is malformed, altered,
+// or presented with a different query or storage adapter than it was made for.
+func TestCursorRoundTripAndRejection(t *testing.T) {
 	t.Parallel()
 
 	at := sessiontest.At("10:00")
 	want := Cursor{
-		Storage:     "postgres",
-		Fingerprint: "query-fingerprint",
+		Storage:     "memory",
+		Fingerprint: "query-a",
 		EvaluatedAt: at,
 		After: SortKey{
 			TenantID: "tenant-a", Username: "alice", IP: "192.0.2.10",
@@ -30,38 +32,21 @@ func TestCursorRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("EncodeCursor() error = %v", err)
 	}
-	got, err := DecodeCursor(encoded, "postgres", "query-fingerprint")
+	got, err := DecodeCursor(encoded, "memory", "query-a")
 	if err != nil {
 		t.Fatalf("DecodeCursor() error = %v", err)
 	}
 	if got != want {
-		t.Fatalf("DecodeCursor() = %+v, want %+v", got, want)
+		t.Errorf("DecodeCursor() = %+v, want %+v", got, want)
 	}
-}
 
-func TestCursorRejectsMalformedAndMismatchedValues(t *testing.T) {
-	t.Parallel()
-
-	at := sessiontest.At("10:00")
-	encoded, err := EncodeCursor(Cursor{
-		Storage:     "memory",
-		Fingerprint: "query-a",
-		EvaluatedAt: at,
-		After: SortKey{
-			TenantID: "tenant-a", Username: "alice", IP: "192.0.2.10",
-			LoginAt: at, SessionID: sessiontest.SessionID(1),
-		},
-	})
-	if err != nil {
-		t.Fatalf("EncodeCursor() error = %v", err)
-	}
 	raw, err := base64.RawURLEncoding.DecodeString(encoded)
 	if err != nil {
-		t.Fatalf("decode fixture cursor: %v", err)
+		t.Fatalf("decode the fixture cursor: %v", err)
 	}
 	withTrailingGarbage := base64.RawURLEncoding.EncodeToString(append(raw, 'x'))
 
-	tests := []struct {
+	rejected := []struct {
 		name        string
 		value       string
 		storage     string
@@ -72,22 +57,20 @@ func TestCursorRejectsMalformedAndMismatchedValues(t *testing.T) {
 		{name: "another storage adapter", value: encoded, storage: "postgres", fingerprint: "query-a"},
 		{name: "another query", value: encoded, storage: "memory", fingerprint: "query-b"},
 	}
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			t.Parallel()
-			if _, err := DecodeCursor(test.value, test.storage, test.fingerprint); !errors.Is(err, repository.ErrInvalidCursor) {
-				t.Fatalf("DecodeCursor() error = %v, want ErrInvalidCursor", err)
-			}
-		})
+	for _, test := range rejected {
+		if _, err := DecodeCursor(test.value, test.storage, test.fingerprint); !errors.Is(err, repository.ErrInvalidCursor) {
+			t.Errorf("%s: DecodeCursor() error = %v, want ErrInvalidCursor", test.name, err)
+		}
 	}
 }
 
+// Sessions order by tenant, then username, then IP, then login time, then ID.
 func TestSortKeyProvidesStableSessionOrdering(t *testing.T) {
 	t.Parallel()
 
 	at := sessiontest.At("10:00")
 	// Each session differs from the first in exactly one sort field, so the
-	// resulting order shows the precedence of tenant, username, IP, then login.
+	// resulting order shows the precedence of those fields.
 	sessions := []session.Session{
 		{ID: "by-tenant", Key: sessiontest.Key("tenant-b", "alice", "192.0.2.1"), LoginAt: at},
 		{ID: "by-username", Key: sessiontest.Key("tenant-a", "bob", "192.0.2.1"), LoginAt: at},

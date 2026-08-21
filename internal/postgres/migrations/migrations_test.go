@@ -18,11 +18,12 @@ import (
 
 const testSchema = "session_handler_migration_test"
 
-func TestApplyCreatesSchemaAndIsRepeatable(t *testing.T) {
+func TestApplyCreatesSchemaIsRepeatableAndRollsBackFailures(t *testing.T) {
 	db := testDatabase(t)
 	resetSchema(t, db)
 
-	// Applying twice must leave the same schema and ledger behind.
+	// Applying twice must leave the same schema and ledger behind, and a
+	// migration that fails partway must leave nothing behind at all.
 	for _, attempt := range []string{"first", "second"} {
 		if err := migrations.Apply(context.Background(), db); err != nil {
 			t.Fatalf("%s Apply() error = %v", attempt, err)
@@ -40,12 +41,7 @@ func TestApplyCreatesSchemaAndIsRepeatable(t *testing.T) {
 	if applied != 2 {
 		t.Errorf("applied migrations = %d, want 2 recorded once each", applied)
 	}
-}
 
-// A migration that fails partway leaves neither its own objects nor a ledger
-// entry, so the next run starts from a clean state.
-func TestApplyRollsBackAFailingMigration(t *testing.T) {
-	db := testDatabase(t)
 	resetSchema(t, db)
 	broken := fstest.MapFS{
 		"sql/001_broken.sql": &fstest.MapFile{Data: []byte(`
@@ -65,9 +61,11 @@ func TestApplyRollsBackAFailingMigration(t *testing.T) {
 	}
 }
 
-// A username identifies one user per tenant, an IP identifies nobody on its
-// own, and only one lifecycle per session key may be active at a time.
-func TestSchemaIdentityAndActiveLifecycleConstraints(t *testing.T) {
+// A username identifies one user per tenant, an IP identifies nobody on its own,
+// and only one lifecycle per session key may be active at a time. Foreign keys
+// and temporal checks hold, the generated ranges answer point queries, and every
+// index the queries rely on exists.
+func TestSchemaConstraintsRangesAndIndexes(t *testing.T) {
 	db := migratedDatabase(t)
 	loginAt := sessiontest.At("10:00")
 
@@ -90,17 +88,14 @@ func TestSchemaIdentityAndActiveLifecycleConstraints(t *testing.T) {
 	if err := insertSession(db, sessiontest.SessionID(4), "tenant-a", "bob", "192.0.2.10", loginAt); err != nil {
 		t.Errorf("a shared IP was rejected: %v", err)
 	}
-}
 
-func TestSchemaForeignKeysAndTemporalChecks(t *testing.T) {
-	db := migratedDatabase(t)
-	loginAt := sessiontest.At("10:00")
+	// Foreign keys and temporal checks, on their own key because one key may
+	// hold only one active lifecycle at a time.
 	sessionID := sessiontest.SessionID(12)
-
-	if err := insertSessionWithLogout(db, sessiontest.SessionID(11), loginAt, loginAt.Add(-time.Second)); err == nil {
+	if err := insertSessionWithLogout(db, sessiontest.SessionID(11), "dana", "192.0.2.30", loginAt, loginAt.Add(-time.Second)); err == nil {
 		t.Error("a lifecycle ending before it started was accepted")
 	}
-	if err := insertSession(db, sessionID, "tenant-a", "alice", "192.0.2.10", loginAt); err != nil {
+	if err := insertSession(db, sessionID, "tenant-a", "dana", "192.0.2.30", loginAt); err != nil {
 		t.Fatalf("insert a valid session: %v", err)
 	}
 	if err := insertState(db, sessiontest.SessionID(99), loginAt, nil); err == nil {
@@ -109,15 +104,10 @@ func TestSchemaForeignKeysAndTemporalChecks(t *testing.T) {
 	if err := insertState(db, sessionID, loginAt, sessiontest.Ptr(loginAt.Add(-time.Second))); err == nil {
 		t.Error("a state ending before it started was accepted")
 	}
-}
 
-// The generated ranges let PostgreSQL answer temporal queries directly, and the
-// indexes backing identity, ordering, and range lookups are all present.
-func TestSchemaGeneratedRangesAndIndexes(t *testing.T) {
-	db := migratedDatabase(t)
-	loginAt := sessiontest.At("10:00")
-	sessionID := sessiontest.SessionID(20)
-	if err := insertSession(db, sessionID, "tenant-a", "alice", "192.0.2.10", loginAt); err != nil {
+	// The generated ranges let PostgreSQL answer temporal queries directly.
+	sessionID = sessiontest.SessionID(20)
+	if err := insertSession(db, sessionID, "tenant-a", "erin", "192.0.2.40", loginAt); err != nil {
 		t.Fatalf("insert a session: %v", err)
 	}
 	if err := insertState(db, sessionID, loginAt, nil); err != nil {
@@ -157,11 +147,11 @@ func insertSession(db *sql.DB, id, tenantID, username, ip string, loginAt time.T
 	return err
 }
 
-func insertSessionWithLogout(db *sql.DB, id string, loginAt, logoutAt time.Time) error {
+func insertSessionWithLogout(db *sql.DB, id, username, ip string, loginAt, logoutAt time.Time) error {
 	_, err := db.Exec(`
 		INSERT INTO sessions (id, tenant_id, username, ip, login_at, logout_at)
-		VALUES ($1::uuid, 'tenant-a', 'alice', '192.0.2.10', $2, $3)
-	`, id, loginAt, logoutAt)
+		VALUES ($1::uuid, 'tenant-a', $2, $3::inet, $4, $5)
+	`, id, username, ip, loginAt, logoutAt)
 	return err
 }
 

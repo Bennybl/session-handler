@@ -25,7 +25,7 @@ const concurrentWriters = 16
 // is read at the same time.
 func TestConcurrentStreamMutationsAndHTTPQueries(t *testing.T) {
 	for _, adapter := range concurrentAdapters(t) {
-		t.Run(adapter.name, func(t *testing.T) {
+		func() {
 			harness := newApplicationHarness(t, adapter.open(t), concurrentIDGenerator())
 
 			writeErrors := make(chan error, concurrentWriters)
@@ -68,20 +68,20 @@ func TestConcurrentStreamMutationsAndHTTPQueries(t *testing.T) {
 
 			for range concurrentWriters {
 				if err := <-writeErrors; err != nil {
-					t.Fatalf("concurrent stream consumer error = %v", err)
+					t.Fatalf("%s: concurrent stream consumer error = %v", adapter.name, err)
 				}
 			}
 			if err := <-readErrors; err != nil {
-				t.Fatalf("concurrent HTTP query error = %v", err)
+				t.Fatalf("%s: concurrent HTTP query error = %v", adapter.name, err)
 			}
 
 			got := queryHTTP(t, harness.handler, map[string]any{"filters": []any{
 				filter("tenantId", "eq", "tenant-concurrent"),
 			}})
 			if len(got.Sessions) != concurrentWriters {
-				t.Fatalf("stored sessions = %d, want one per writer (%d)", len(got.Sessions), concurrentWriters)
+				t.Fatalf("%s: stored sessions = %d, want one per writer (%d)", adapter.name, len(got.Sessions), concurrentWriters)
 			}
-		})
+		}()
 	}
 }
 

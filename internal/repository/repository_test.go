@@ -10,37 +10,31 @@ import (
 	"github.com/Bennybl/session-handler/internal/sessiontest"
 )
 
-// A mutation callback reads the domain snapshot and answers with a typed
-// mutation, which is the whole contract between a repository and the domain.
-func TestMutationFuncUsesDomainSnapshotAndTypedMutation(t *testing.T) {
+// The boundary between a repository and the domain is a callback that reads a
+// snapshot and answers with a typed mutation, plus a set of failures callers
+// distinguish, so none of them may wrap another.
+func TestRepositoryBoundaryTypesAndErrors(t *testing.T) {
 	t.Parallel()
 
 	at := sessiontest.At("10:00")
-	snapshot := session.CurrentSessionSnapshot{LastEventAt: &at}
 	want := session.EndSession{
 		EventID: sessiontest.EventID(1), SessionID: sessiontest.SessionID(1),
 		CloseCurrentAt: at, LogoutAt: at,
 	}
-
 	decide := repository.MutationFunc(func(got session.CurrentSessionSnapshot) (session.Mutation, error) {
 		if got.LastEventAt == nil || !got.LastEventAt.Equal(at) {
-			t.Fatalf("LastEventAt = %v, want %v", got.LastEventAt, at)
+			t.Errorf("LastEventAt = %v, want %v", got.LastEventAt, at)
 		}
 		return want, nil
 	})
 
-	got, err := decide(snapshot)
+	got, err := decide(session.CurrentSessionSnapshot{LastEventAt: &at})
 	if err != nil {
 		t.Fatalf("MutationFunc() error = %v", err)
 	}
 	if got != want {
-		t.Fatalf("MutationFunc() = %#v, want %#v", got, want)
+		t.Errorf("MutationFunc() = %#v, want %#v", got, want)
 	}
-}
-
-// Callers distinguish these failures, so none may wrap another.
-func TestRepositoryErrorsAreDistinct(t *testing.T) {
-	t.Parallel()
 
 	named := map[string]error{
 		"ErrClosed":        repository.ErrClosed,

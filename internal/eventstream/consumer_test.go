@@ -15,45 +15,24 @@ import (
 	"github.com/Bennybl/session-handler/internal/sessiontest"
 )
 
-// A message is acknowledged only once the repository has committed it, so a
-// crash before the commit leaves the message to be redelivered.
-func TestConsumerAcknowledgesOnlyAfterSuccessfulApplication(t *testing.T) {
+// A message is acknowledged only after the repository has committed it, so a
+// crash before the commit leaves it to be redelivered. A redelivery that was
+// already applied is acknowledged without opening a second lifecycle, which is
+// what makes at-least-once delivery safe.
+func TestConsumerAcknowledgesAfterApplicationAndOnRedelivery(t *testing.T) {
 	t.Parallel()
 
 	steps := &journal{}
 	message := newMessage(steps, validEventJSON())
 	consumer := newConsumer(t, &sourceStub{messages: []Message{message}}, appliesWith(steps, nil), nil, Options{})
-
 	if err := consumer.Run(context.Background()); err != nil {
 		t.Fatalf("Run() error = %v", err)
 	}
 	if want := []string{"apply", "ack"}; !reflect.DeepEqual(steps.steps, want) {
 		t.Fatalf("operations = %v, want %v", steps.steps, want)
 	}
-}
 
-func TestConsumerAcknowledgesSuccessfulDuplicate(t *testing.T) {
-	t.Parallel()
-
-	// The service reports a repeated event as a success, and the consumer must
-	// treat that like any other success rather than retrying it.
-	steps := &journal{}
-	message := newMessage(steps, validEventJSON())
-	consumer := newConsumer(t, &sourceStub{messages: []Message{message}}, appliesWith(steps, nil), nil, Options{})
-
-	if err := consumer.Run(context.Background()); err != nil {
-		t.Fatalf("Run() error = %v", err)
-	}
-	if want := []string{"apply", "ack"}; !reflect.DeepEqual(steps.steps, want) {
-		t.Fatalf("operations = %v, want %v", steps.steps, want)
-	}
-}
-
-// Redelivering an already applied event acknowledges it without opening a
-// second lifecycle, which is what makes at-least-once delivery safe.
-func TestConsumerAcknowledgesRedeliveryWithoutCreatingAnotherLifecycle(t *testing.T) {
-	t.Parallel()
-
+	// The same event twice, through the real service and store.
 	sessionID := sessiontest.SessionID(901)
 	repo := memory.New()
 	t.Cleanup(func() { _ = repo.Close() })
@@ -64,17 +43,16 @@ func TestConsumerAcknowledgesRedeliveryWithoutCreatingAnotherLifecycle(t *testin
 	if err != nil {
 		t.Fatalf("service.New() error = %v", err)
 	}
-
-	steps := &journal{}
-	first := newMessage(steps, validEventJSON())
-	redelivery := newMessage(steps, validEventJSON())
-	consumer := newConsumer(t, &sourceStub{messages: []Message{first, redelivery}}, application, nil, Options{})
-	if err := consumer.Run(context.Background()); err != nil {
+	redelivered := &journal{}
+	first := newMessage(redelivered, validEventJSON())
+	second := newMessage(redelivered, validEventJSON())
+	redeliveryConsumer := newConsumer(t, &sourceStub{messages: []Message{first, second}}, application, nil, Options{})
+	if err := redeliveryConsumer.Run(context.Background()); err != nil {
 		t.Fatalf("Run() error = %v", err)
 	}
 
-	if want := []string{"ack", "ack"}; !reflect.DeepEqual(steps.steps, want) {
-		t.Fatalf("operations = %v, want both messages acknowledged", steps.steps)
+	if want := []string{"ack", "ack"}; !reflect.DeepEqual(redelivered.steps, want) {
+		t.Fatalf("operations = %v, want both messages acknowledged", redelivered.steps)
 	}
 	result := sessiontest.Query(t, repo, sessiontest.Spec(sessiontest.At("10:01"),
 		sessiontest.Filter("sessionId", "eq", sessionID),
@@ -83,37 +61,32 @@ func TestConsumerAcknowledgesRedeliveryWithoutCreatingAnotherLifecycle(t *testin
 		t.Fatalf("stored sessions = %+v, want exactly one lifecycle", result.Sessions)
 	}
 	if len(result.Sessions[0].States) != 1 {
-		t.Fatalf("stored states = %+v, want the redelivery to add none", result.Sessions[0].States)
+		t.Errorf("stored states = %+v, want the redelivery to add none", result.Sessions[0].States)
 	}
 }
 
-// A transient failure is retried later rather than dropped.
-func TestConsumerDelaysTransientFailure(t *testing.T) {
+// A failure that may pass later is retried after a delay. One that never can is
+// dead-lettered first and terminated only once the dead letter is stored, and if
+// that store fails the original is retried rather than dropped.
+func TestConsumerRetriesTransientFailuresAndDeadLettersPermanentOnes(t *testing.T) {
 	t.Parallel()
 
 	retryDelay := 7 * time.Second
 	steps := &journal{}
 	message := newMessage(steps, validEventJSON())
-	applier := appliesWith(steps, errors.New("database unavailable"))
-	consumer := newConsumer(t, &sourceStub{messages: []Message{message}}, applier, nil, Options{RetryDelay: retryDelay})
-
+	transient := appliesWith(steps, errors.New("database unavailable"))
+	consumer := newConsumer(t, &sourceStub{messages: []Message{message}}, transient, nil, Options{RetryDelay: retryDelay})
 	if err := consumer.Run(context.Background()); err != nil {
 		t.Fatalf("Run() error = %v", err)
 	}
 	if want := []string{"apply", "nak"}; !reflect.DeepEqual(steps.steps, want) {
-		t.Fatalf("operations = %v, want %v", steps.steps, want)
+		t.Errorf("operations = %v, want %v", steps.steps, want)
 	}
 	if message.nakDelay != retryDelay {
 		t.Errorf("retry delay = %v, want %v", message.nakDelay, retryDelay)
 	}
-}
 
-// An event that can never succeed is dead-lettered first and terminated only
-// after the dead letter is safely stored.
-func TestConsumerDeadLettersBeforeTerminating(t *testing.T) {
-	t.Parallel()
-
-	tests := []struct {
+	permanent := []struct {
 		name       string
 		data       []byte
 		applyError error
@@ -121,53 +94,45 @@ func TestConsumerDeadLettersBeforeTerminating(t *testing.T) {
 		{name: "permanent domain error", data: validEventJSON(), applyError: session.ErrInvalidTransition},
 		{name: "malformed envelope", data: []byte(`{"eventId":`)},
 	}
-
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			t.Parallel()
-			steps := &journal{}
-			message := newMessage(steps, test.data)
-			var got DeadLetter
-			publisher := deadLetterFunc(func(_ context.Context, letter DeadLetter) error {
-				steps.add("dlq")
-				got = letter
-				return nil
-			})
-			applier := applierFunc(func(context.Context, service.Event) error { return test.applyError })
-			consumer := newConsumer(t, &sourceStub{messages: []Message{message}}, applier, publisher, Options{})
-
-			if err := consumer.Run(context.Background()); err != nil {
-				t.Fatalf("Run() error = %v", err)
-			}
-			if want := []string{"dlq", "term"}; !reflect.DeepEqual(steps.steps, want) {
-				t.Fatalf("operations = %v, want %v", steps.steps, want)
-			}
-			if !reflect.DeepEqual(got.Payload, test.data) {
-				t.Errorf("dead letter payload = %q, want the original message %q", got.Payload, test.data)
-			}
-			if got.Reason == "" {
-				t.Error("the dead letter carries no reason")
-			}
+	for _, test := range permanent {
+		letters := &journal{}
+		failed := newMessage(letters, test.data)
+		var got DeadLetter
+		publisher := deadLetterFunc(func(_ context.Context, letter DeadLetter) error {
+			letters.add("dlq")
+			got = letter
+			return nil
 		})
+		applier := applierFunc(func(context.Context, service.Event) error { return test.applyError })
+		deadLetterConsumer := newConsumer(t, &sourceStub{messages: []Message{failed}}, applier, publisher, Options{})
+
+		if err := deadLetterConsumer.Run(context.Background()); err != nil {
+			t.Errorf("%s: Run() error = %v", test.name, err)
+			continue
+		}
+		if want := []string{"dlq", "term"}; !reflect.DeepEqual(letters.steps, want) {
+			t.Errorf("%s: operations = %v, want %v", test.name, letters.steps, want)
+		}
+		if !reflect.DeepEqual(got.Payload, test.data) {
+			t.Errorf("%s: dead letter payload = %q, want the original %q", test.name, got.Payload, test.data)
+		}
+		if got.Reason == "" {
+			t.Errorf("%s: the dead letter carries no reason", test.name)
+		}
 	}
-}
 
-// If the dead letter cannot be published, the original message is retried
-// instead of being terminated and lost.
-func TestConsumerRetriesWhenDeadLetterPublishFails(t *testing.T) {
-	t.Parallel()
-
-	steps := &journal{}
-	message := newMessage(steps, []byte(`not-json`))
-	publisher := deadLetterFunc(func(context.Context, DeadLetter) error { return errors.New("DLQ unavailable") })
-	applier := applierFunc(func(context.Context, service.Event) error { return nil })
-	consumer := newConsumer(t, &sourceStub{messages: []Message{message}}, applier, publisher, Options{RetryDelay: time.Second})
-
-	if err := consumer.Run(context.Background()); err != nil {
+	unpublishable := &journal{}
+	undeliverable := newMessage(unpublishable, []byte(`not-json`))
+	failingPublisher := deadLetterFunc(func(context.Context, DeadLetter) error {
+		return errors.New("DLQ unavailable")
+	})
+	noop := applierFunc(func(context.Context, service.Event) error { return nil })
+	retryConsumer := newConsumer(t, &sourceStub{messages: []Message{undeliverable}}, noop, failingPublisher, Options{RetryDelay: time.Second})
+	if err := retryConsumer.Run(context.Background()); err != nil {
 		t.Fatalf("Run() error = %v", err)
 	}
-	if want := []string{"nak"}; !reflect.DeepEqual(steps.steps, want) {
-		t.Fatalf("operations = %v, want %v", steps.steps, want)
+	if want := []string{"nak"}; !reflect.DeepEqual(unpublishable.steps, want) {
+		t.Errorf("operations = %v, want the original message retried, not terminated", unpublishable.steps)
 	}
 }
 

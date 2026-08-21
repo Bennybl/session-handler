@@ -18,8 +18,9 @@ var (
 	acceptedEventID    = sessiontest.EventID(902)
 )
 
-// Each event type reaches its own domain decision, and the service canonicalizes
-// the type, key, and tags on the way.
+// Each event type reaches its own domain decision, the service canonicalizes the
+// type, key, and tags on the way, and a repeat of the last accepted event is
+// reported as a successful no-op.
 func TestApplyEventDispatchesAndNormalizes(t *testing.T) {
 	t.Parallel()
 
@@ -27,7 +28,7 @@ func TestApplyEventDispatchesAndNormalizes(t *testing.T) {
 	canonicalKey := sessiontest.Key("tenant-a", "alice", "2001:db8::1")
 	active := sessiontest.ActiveSession(canonicalKey, generatedSessionID, sessiontest.EventID(901), loginAt, "user")
 
-	tests := []struct {
+	dispatches := []struct {
 		name      string
 		eventType EventType
 		snapshot  session.CurrentSessionSnapshot
@@ -37,71 +38,91 @@ func TestApplyEventDispatchesAndNormalizes(t *testing.T) {
 		{name: "update", eventType: "update", snapshot: active, wantKind: session.MutationReplaceState},
 		{name: "logout", eventType: "LOGOUT", snapshot: active, wantKind: session.MutationEndSession},
 	}
-
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			t.Parallel()
-			var gotKey session.SessionKey
-			var gotMutation session.Mutation
-			repo := &repositoryStub{mutate: func(_ context.Context, key session.SessionKey, decide repository.MutationFunc) error {
-				gotKey = key
-				var err error
-				gotMutation, err = decide(test.snapshot)
-				return err
-			}}
-			generated := 0
-			service := newService(t, Dependencies{
-				Repository:   repo,
-				NewSessionID: func() (string, error) { generated++; return generatedSessionID, nil },
-			})
-
-			// The event arrives with a padded type, an expanded IPv6 address,
-			// and a repeated tag.
-			err := service.ApplyEvent(context.Background(), Event{
-				EventID: acceptedEventID, Type: test.eventType,
-				TenantID: "tenant-a", Username: "alice", IP: "2001:0db8:0:0:0:0:0:1",
-				Tags: []string{"user", "admin", "user"}, Timestamp: loginAt.Add(time.Minute),
-			})
-			if err != nil {
-				t.Fatalf("ApplyEvent() error = %v", err)
-			}
-
-			if gotKey != canonicalKey {
-				t.Errorf("mutation key = %+v, want the canonical %+v", gotKey, canonicalKey)
-			}
-			if gotMutation == nil || gotMutation.Kind() != test.wantKind {
-				t.Fatalf("mutation = %#v, want kind %q", gotMutation, test.wantKind)
-			}
-			if got := gotMutation.AcceptedEventID(); got != acceptedEventID {
-				t.Errorf("accepted event ID = %q, want %q", got, acceptedEventID)
-			}
-
-			// Only a login mints a session ID and normalizes tags into a state.
-			wantGenerated := 0
-			if test.wantKind == session.MutationStartSession {
-				wantGenerated = 1
-				started := gotMutation.(session.StartSession)
-				if started.Session.ID != generatedSessionID {
-					t.Errorf("session ID = %q, want the generated %q", started.Session.ID, generatedSessionID)
-				}
-				if want := []string{"admin", "user"}; !reflect.DeepEqual(started.Session.States[0].Tags, want) {
-					t.Errorf("tags = %v, want deduplicated and sorted %v", started.Session.States[0].Tags, want)
-				}
-			}
-			if generated != wantGenerated {
-				t.Errorf("session IDs generated = %d, want %d", generated, wantGenerated)
-			}
+	for _, test := range dispatches {
+		var gotKey session.SessionKey
+		var gotMutation session.Mutation
+		repo := &repositoryStub{mutate: func(_ context.Context, key session.SessionKey, decide repository.MutationFunc) error {
+			gotKey = key
+			var err error
+			gotMutation, err = decide(test.snapshot)
+			return err
+		}}
+		generated := 0
+		service := newService(t, Dependencies{
+			Repository:   repo,
+			NewSessionID: func() (string, error) { generated++; return generatedSessionID, nil },
 		})
+
+		// The event arrives with a padded type, an expanded IPv6 address, and a
+		// repeated tag.
+		err := service.ApplyEvent(context.Background(), Event{
+			EventID: acceptedEventID, Type: test.eventType,
+			TenantID: "tenant-a", Username: "alice", IP: "2001:0db8:0:0:0:0:0:1",
+			Tags: []string{"user", "admin", "user"}, Timestamp: loginAt.Add(time.Minute),
+		})
+		if err != nil {
+			t.Errorf("%s: ApplyEvent() error = %v", test.name, err)
+			continue
+		}
+		if gotKey != canonicalKey {
+			t.Errorf("%s: mutation key = %+v, want the canonical %+v", test.name, gotKey, canonicalKey)
+		}
+		if gotMutation == nil || gotMutation.Kind() != test.wantKind {
+			t.Errorf("%s: mutation = %#v, want kind %q", test.name, gotMutation, test.wantKind)
+			continue
+		}
+		if got := gotMutation.AcceptedEventID(); got != acceptedEventID {
+			t.Errorf("%s: accepted event ID = %q, want %q", test.name, got, acceptedEventID)
+		}
+
+		// Only a login mints a session ID and normalizes tags into a state.
+		wantGenerated := 0
+		if test.wantKind == session.MutationStartSession {
+			wantGenerated = 1
+			started := gotMutation.(session.StartSession)
+			if started.Session.ID != generatedSessionID {
+				t.Errorf("%s: session ID = %q, want the generated %q", test.name, started.Session.ID, generatedSessionID)
+			}
+			if want := []string{"admin", "user"}; !reflect.DeepEqual(started.Session.States[0].Tags, want) {
+				t.Errorf("%s: tags = %v, want deduplicated and sorted %v", test.name, started.Session.States[0].Tags, want)
+			}
+		}
+		if generated != wantGenerated {
+			t.Errorf("%s: session IDs generated = %d, want %d", test.name, generated, wantGenerated)
+		}
+	}
+
+	// Replaying the last accepted event changes nothing, which is what lets the
+	// stream consumer acknowledge a redelivery.
+	at := sessiontest.At("10:00")
+	var duplicate session.Mutation
+	repo := &repositoryStub{mutate: func(_ context.Context, _ session.SessionKey, decide repository.MutationFunc) error {
+		var err error
+		duplicate, err = decide(session.CurrentSessionSnapshot{LastEventAt: &at, LastEventID: acceptedEventID})
+		return err
+	}}
+	service := newService(t, Dependencies{Repository: repo})
+	err := service.ApplyEvent(context.Background(), Event{
+		EventID: acceptedEventID, Type: EventUpdate,
+		TenantID: "tenant-a", Username: "alice", IP: "192.0.2.10",
+		Tags: []string{"ignored"}, Timestamp: at.Add(-time.Hour),
+	})
+	if err != nil {
+		t.Fatalf("ApplyEvent() for a repeated event error = %v", err)
+	}
+	if duplicate == nil || duplicate.Kind() != session.MutationDuplicateEvent {
+		t.Errorf("mutation = %#v, want a duplicate-event no-op", duplicate)
 	}
 }
 
-// A repository may run the callback more than once when it retries, so the
-// session ID is minted outside it and stays the same across attempts.
-func TestApplyEventCreatesOneStableSessionIDOutsideRepositoryRetries(t *testing.T) {
+// A session ID is minted once per login, outside the callback a repository may
+// retry, and a generator failure stops the event before storage is touched. The
+// default generator produces canonical version 4 UUIDs.
+func TestApplyEventCreatesSessionIDsOutsideRepositoryRetries(t *testing.T) {
 	t.Parallel()
 
 	var seen []string
-	repo := &repositoryStub{mutate: func(_ context.Context, _ session.SessionKey, decide repository.MutationFunc) error {
+	retrying := &repositoryStub{mutate: func(_ context.Context, _ session.SessionKey, decide repository.MutationFunc) error {
 		for range 2 {
 			mutation, err := decide(session.CurrentSessionSnapshot{})
 			if err != nil {
@@ -113,10 +134,9 @@ func TestApplyEventCreatesOneStableSessionIDOutsideRepositoryRetries(t *testing.
 	}}
 	generated := 0
 	service := newService(t, Dependencies{
-		Repository:   repo,
+		Repository:   retrying,
 		NewSessionID: func() (string, error) { generated++; return generatedSessionID, nil },
 	})
-
 	if err := service.ApplyEvent(context.Background(), loginEvent()); err != nil {
 		t.Fatalf("ApplyEvent() error = %v", err)
 	}
@@ -126,28 +146,19 @@ func TestApplyEventCreatesOneStableSessionIDOutsideRepositoryRetries(t *testing.
 	if want := []string{generatedSessionID, generatedSessionID}; !reflect.DeepEqual(seen, want) {
 		t.Errorf("session IDs seen by the callback = %v, want %v", seen, want)
 	}
-}
-
-func TestApplyEventPropagatesSessionIDGenerationFailureWithoutMutation(t *testing.T) {
-	t.Parallel()
 
 	generationError := errors.New("entropy unavailable")
-	repo := &repositoryStub{}
-	service := newService(t, Dependencies{
-		Repository:   repo,
+	failing := &repositoryStub{}
+	failingService := newService(t, Dependencies{
+		Repository:   failing,
 		NewSessionID: func() (string, error) { return "", generationError },
 	})
-
-	if err := service.ApplyEvent(context.Background(), loginEvent()); !errors.Is(err, generationError) {
+	if err := failingService.ApplyEvent(context.Background(), loginEvent()); !errors.Is(err, generationError) {
 		t.Errorf("ApplyEvent() error = %v, want the generation error", err)
 	}
-	if repo.mutateCalls != 0 {
-		t.Errorf("repository mutations = %d, want 0", repo.mutateCalls)
+	if failing.mutateCalls != 0 {
+		t.Errorf("repository mutations = %d, want 0", failing.mutateCalls)
 	}
-}
-
-func TestDefaultSessionIDGeneratorCreatesCanonicalV4UUIDs(t *testing.T) {
-	t.Parallel()
 
 	first, err := newUUID()
 	if err != nil {
@@ -160,7 +171,6 @@ func TestDefaultSessionIDGeneratorCreatesCanonicalV4UUIDs(t *testing.T) {
 	if first == second {
 		t.Fatalf("newUUID() repeated %q", first)
 	}
-
 	for _, value := range []string{first, second} {
 		normalized, err := normalizeUUID(value)
 		if err != nil {
@@ -176,34 +186,6 @@ func TestDefaultSessionIDGeneratorCreatesCanonicalV4UUIDs(t *testing.T) {
 		if !strings.ContainsRune("89ab", rune(value[19])) {
 			t.Errorf("newUUID() = %q, want an RFC 4122 variant at index 19", value)
 		}
-	}
-}
-
-// Replaying the last accepted event succeeds without changing anything, which
-// is what lets the stream consumer acknowledge a redelivery.
-func TestApplyEventTreatsLatestEventIDAsSuccessfulDuplicate(t *testing.T) {
-	t.Parallel()
-
-	at := sessiontest.At("10:00")
-	key := sessiontest.Key("tenant-a", "alice", "192.0.2.10")
-	var got session.Mutation
-	repo := &repositoryStub{mutate: func(_ context.Context, _ session.SessionKey, decide repository.MutationFunc) error {
-		var err error
-		got, err = decide(session.CurrentSessionSnapshot{LastEventAt: &at, LastEventID: acceptedEventID})
-		return err
-	}}
-	service := newService(t, Dependencies{Repository: repo})
-
-	err := service.ApplyEvent(context.Background(), Event{
-		EventID: acceptedEventID, Type: EventUpdate,
-		TenantID: key.TenantID, Username: key.Username, IP: key.IP,
-		Tags: []string{"ignored"}, Timestamp: at.Add(-time.Hour),
-	})
-	if err != nil {
-		t.Fatalf("ApplyEvent() error = %v", err)
-	}
-	if got == nil || got.Kind() != session.MutationDuplicateEvent {
-		t.Fatalf("mutation = %#v, want a duplicate-event no-op", got)
 	}
 }
 
@@ -223,22 +205,21 @@ func TestApplyEventValidatesBeforeCallingRepository(t *testing.T) {
 	}
 
 	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			event := loginEvent()
-			test.spoil(&event)
-			if err := service.ApplyEvent(context.Background(), event); !errors.Is(err, session.ErrInvalidInput) {
-				t.Fatalf("ApplyEvent() error = %v, want ErrInvalidInput", err)
-			}
-		})
+		event := loginEvent()
+		test.spoil(&event)
+		if err := service.ApplyEvent(context.Background(), event); !errors.Is(err, session.ErrInvalidInput) {
+			t.Errorf("%s: ApplyEvent() error = %v, want ErrInvalidInput", test.name, err)
+		}
 	}
 	if repo.mutateCalls != 0 {
 		t.Errorf("repository mutations = %d, want 0", repo.mutateCalls)
 	}
 }
 
-// The service reads the clock once per query and hands the filters to the
-// repository untouched, so it stays unaware of what any field means.
-func TestQueryCapturesClockOnceAndForwardsGenericSpecification(t *testing.T) {
+// The service reads the clock once per query and forwards the filters untouched,
+// so it stays unaware of what any field means. It checks only the shape of a
+// query, refuses cancelled work, and passes repository failures through.
+func TestQueryForwardsSpecificationValidatesShapeAndPropagatesErrors(t *testing.T) {
 	t.Parallel()
 
 	now := time.Date(2026, 8, 21, 12, 0, 0, 0, time.FixedZone("UTC+3", 3*60*60))
@@ -252,12 +233,12 @@ func TestQueryCapturesClockOnceAndForwardsGenericSpecification(t *testing.T) {
 		NextCursor: "next",
 	}
 	var gotSpec session.QuerySpec
-	repo := &repositoryStub{query: func(_ context.Context, spec session.QuerySpec) (session.QueryResult, error) {
+	forwarding := &repositoryStub{query: func(_ context.Context, spec session.QuerySpec) (session.QueryResult, error) {
 		gotSpec = spec
 		return wantResult, nil
 	}}
 	service := newService(t, Dependencies{
-		Repository: repo,
+		Repository: forwarding,
 		Now:        func() time.Time { clockReads++; return now },
 	})
 
@@ -280,16 +261,10 @@ func TestQueryCapturesClockOnceAndForwardsGenericSpecification(t *testing.T) {
 	if gotSpec.Page != request.Page {
 		t.Errorf("forwarded page = %+v, want %+v", gotSpec.Page, request.Page)
 	}
-}
 
-// The service checks only the shape of a query. Deciding whether a field or
-// operator exists belongs to the repository registries.
-func TestQueryRejectsOnlyStructurallyInvalidFilters(t *testing.T) {
-	t.Parallel()
-
-	repo := &repositoryStub{}
-	service := newService(t, Dependencies{Repository: repo})
-	tests := []struct {
+	rejecting := &repositoryStub{}
+	rejectingService := newService(t, Dependencies{Repository: rejecting})
+	malformed := []struct {
 		name    string
 		request QueryRequest
 	}{
@@ -298,51 +273,43 @@ func TestQueryRejectsOnlyStructurallyInvalidFilters(t *testing.T) {
 		{name: "missing value", request: QueryRequest{Filters: []session.Filter{{Field: "tenantId", Operator: "eq"}}}},
 		{name: "negative limit", request: QueryRequest{Page: session.PageRequest{Limit: -1}}},
 	}
-
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			if _, err := service.Query(context.Background(), test.request); !errors.Is(err, repository.ErrInvalidQuery) {
-				t.Fatalf("Query() error = %v, want ErrInvalidQuery", err)
-			}
-		})
+	for _, test := range malformed {
+		if _, err := rejectingService.Query(context.Background(), test.request); !errors.Is(err, repository.ErrInvalidQuery) {
+			t.Errorf("%s: Query() error = %v, want ErrInvalidQuery", test.name, err)
+		}
 	}
-	if repo.queryCalls != 0 {
-		t.Errorf("repository queries = %d, want 0", repo.queryCalls)
+	if rejecting.queryCalls != 0 {
+		t.Errorf("repository queries = %d, want 0", rejecting.queryCalls)
 	}
-}
-
-func TestServiceHonorsCancellationAndPropagatesRepositoryErrors(t *testing.T) {
-	t.Parallel()
 
 	repositoryError := errors.New("repository unavailable")
-	repo := &repositoryStub{
+	failing := &repositoryStub{
 		mutate: func(context.Context, session.SessionKey, repository.MutationFunc) error { return repositoryError },
 		query: func(context.Context, session.QuerySpec) (session.QueryResult, error) {
 			return session.QueryResult{}, repositoryError
 		},
 	}
-	service := newService(t, Dependencies{
-		Repository:   repo,
+	failingService := newService(t, Dependencies{
+		Repository:   failing,
 		NewSessionID: func() (string, error) { return generatedSessionID, nil },
 	})
-
-	if err := service.ApplyEvent(context.Background(), loginEvent()); !errors.Is(err, repositoryError) {
+	if err := failingService.ApplyEvent(context.Background(), loginEvent()); !errors.Is(err, repositoryError) {
 		t.Errorf("ApplyEvent() error = %v, want the repository error", err)
 	}
-	if _, err := service.Query(context.Background(), QueryRequest{}); !errors.Is(err, repositoryError) {
+	if _, err := failingService.Query(context.Background(), QueryRequest{}); !errors.Is(err, repositoryError) {
 		t.Errorf("Query() error = %v, want the repository error", err)
 	}
 
 	cancelled, cancel := context.WithCancel(context.Background())
 	cancel()
-	mutationsBefore, queriesBefore := repo.mutateCalls, repo.queryCalls
-	if err := service.ApplyEvent(cancelled, loginEvent()); !errors.Is(err, context.Canceled) {
+	mutationsBefore, queriesBefore := failing.mutateCalls, failing.queryCalls
+	if err := failingService.ApplyEvent(cancelled, loginEvent()); !errors.Is(err, context.Canceled) {
 		t.Errorf("cancelled ApplyEvent() error = %v, want context.Canceled", err)
 	}
-	if _, err := service.Query(cancelled, QueryRequest{}); !errors.Is(err, context.Canceled) {
+	if _, err := failingService.Query(cancelled, QueryRequest{}); !errors.Is(err, context.Canceled) {
 		t.Errorf("cancelled Query() error = %v, want context.Canceled", err)
 	}
-	if repo.mutateCalls != mutationsBefore || repo.queryCalls != queriesBefore {
+	if failing.mutateCalls != mutationsBefore || failing.queryCalls != queriesBefore {
 		t.Error("a cancelled operation still reached the repository")
 	}
 }

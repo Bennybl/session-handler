@@ -17,16 +17,17 @@ func TestQueryContract(t *testing.T) {
 	runContractCases(t, "generic state scoped filters", "pagination and stable cursors", "query result isolation")
 }
 
-func TestQuerySupportsEveryRegistryEntry(t *testing.T) {
+// Every registered field and operator compiles to working SQL, and the
+// state-scoped filters combine into one correlated predicate, so they must be
+// satisfied by the same state row before the complete history is returned.
+func TestQuerySupportsEveryRegistryEntryAndStateScoping(t *testing.T) {
 	repo := freshRepository(t)
 	key := sessiontest.Key("tenant-a", "alice", "192.0.2.10")
-	loginAt := sessiontest.At("10:00")
-	evaluatedAt := sessiontest.At("10:30")
+	loginAt, evaluatedAt := sessiontest.At("10:00"), sessiontest.At("10:30")
 	sessiontest.Login(t, repo, key, firstSessionID, loginAt, "user")
 
-	// Every filter below describes the one seeded session, so each registry
-	// entry is exercised against real SQL.
-	tests := []struct {
+	// Every filter below describes the one seeded session.
+	filters := []struct {
 		name   string
 		filter session.Filter
 	}{
@@ -49,60 +50,51 @@ func TestQuerySupportsEveryRegistryEntry(t *testing.T) {
 		{name: "login time less or equal", filter: sessiontest.Filter("loginTime", "lte", loginAt)},
 		{name: "login time between", filter: sessiontest.Filter("loginTime", "between", interval("09:59", "10:01"))},
 	}
-
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			result := sessiontest.Query(t, repo, sessiontest.Spec(evaluatedAt, test.filter))
-			if len(result.Sessions) != 1 || result.Sessions[0].ID != firstSessionID {
-				t.Fatalf("matching sessions = %+v, want only %q", result.Sessions, firstSessionID)
-			}
-		})
+	for _, test := range filters {
+		result := sessiontest.Query(t, repo, sessiontest.Spec(evaluatedAt, test.filter))
+		if len(result.Sessions) != 1 || result.Sessions[0].ID != firstSessionID {
+			t.Errorf("%s: matching sessions = %+v, want only %q", test.name, result.Sessions, firstSessionID)
+		}
 	}
-}
 
-// Activity and tag filters compile into one correlated predicate, so they must
-// be satisfied by the same state row.
-func TestQueryUsesOneMatchingStateAndLoadsCompleteHistory(t *testing.T) {
-	repo := freshRepository(t)
-	key := sessiontest.Key("tenant-a", "alice", "192.0.2.10")
-	loginAt, updateAt := sessiontest.At("10:00"), sessiontest.At("11:00")
-	evaluatedAt := sessiontest.At("11:01")
-	sessiontest.Login(t, repo, key, firstSessionID, loginAt, "user")
+	updateAt := sessiontest.At("11:00")
+	laterEvaluation := sessiontest.At("11:01")
 	sessiontest.Update(t, repo, key, updateAt, "admin")
 
 	// At 10:30 the session was tagged "user", not "admin".
-	mismatched := sessiontest.Query(t, repo, sessiontest.Spec(evaluatedAt,
-		sessiontest.Filter("activity", "at", sessiontest.At("10:30")),
+	mismatched := sessiontest.Query(t, repo, sessiontest.Spec(laterEvaluation,
+		sessiontest.Filter("activity", "at", evaluatedAt),
 		sessiontest.Filter("tags", "containsAll", []string{"admin"}),
 	))
 	if len(mismatched.Sessions) != 0 {
-		t.Fatalf("matching sessions = %+v, want none; the filters matched different states", mismatched.Sessions)
+		t.Errorf("matching sessions = %+v, want none; the filters matched different states", mismatched.Sessions)
 	}
 
-	// After 11:00 both filters describe the same state, and the response then
-	// carries the session's complete history.
-	matched := sessiontest.Query(t, repo, sessiontest.Spec(evaluatedAt,
-		sessiontest.Filter("activity", "at", evaluatedAt),
+	// After 11:00 both filters describe the same state.
+	matched := sessiontest.Query(t, repo, sessiontest.Spec(laterEvaluation,
+		sessiontest.Filter("activity", "at", laterEvaluation),
 		sessiontest.Filter("tags", "containsAll", []string{"admin"}),
 	))
 	if len(matched.Sessions) != 1 {
 		t.Fatalf("matching sessions = %+v, want one", matched.Sessions)
 	}
 	if len(matched.Sessions[0].States) != 2 {
-		t.Fatalf("states = %+v, want the complete two-state history", matched.Sessions[0].States)
+		t.Errorf("states = %+v, want the complete two-state history", matched.Sessions[0].States)
 	}
 }
 
-// Paging counts sessions, not the state rows they join to, so a session with
-// several matching states still occupies one slot on a page.
-func TestQueryPagesDistinctSessionsAcrossKeysetBoundaries(t *testing.T) {
+// Paging counts sessions rather than the state rows they join to, and neither
+// field names, operators, nor values can contribute SQL syntax.
+func TestQueryPagingAndInjectionSafety(t *testing.T) {
 	repo := freshRepository(t)
+	ctx := context.Background()
 	loginAt, updateAt := sessiontest.At("10:00"), sessiontest.At("11:00")
 	alice := sessiontest.Key("tenant-a", "alice", "192.0.2.10")
 	sessiontest.Login(t, repo, alice, firstSessionID, loginAt, "user")
 	sessiontest.Update(t, repo, alice, updateAt, "user")
 	sessiontest.Login(t, repo, sessiontest.Key("tenant-a", "bob", "192.0.2.10"), secondSessionID, loginAt, "user")
 
+	// Alice has two matching states but still occupies one slot on a page.
 	spec := session.QuerySpec{
 		Filters:     []session.Filter{sessiontest.Filter("activity", "overlaps", interval("10:00", "12:00"))},
 		Page:        session.PageRequest{Limit: 1},
@@ -113,25 +105,15 @@ func TestQueryPagesDistinctSessionsAcrossKeysetBoundaries(t *testing.T) {
 		t.Fatalf("first page = %+v, want only %q and a cursor", first, firstSessionID)
 	}
 	if len(first.Sessions[0].States) != 2 {
-		t.Fatalf("first page states = %+v, want both of Alice's states", first.Sessions[0].States)
+		t.Errorf("first page states = %+v, want both of Alice's states", first.Sessions[0].States)
 	}
-
 	spec.Page.Cursor = first.NextCursor
 	second := sessiontest.Query(t, repo, spec)
 	if len(second.Sessions) != 1 || second.Sessions[0].ID != secondSessionID || second.NextCursor != "" {
 		t.Fatalf("second page = %+v, want only %q and no cursor", second, secondSessionID)
 	}
-}
 
-// Field names, operators, and values never reach the SQL text: unknown names
-// are rejected and values are always bound as parameters.
-func TestQueryRejectsUnsupportedAndInjectionShapedInputs(t *testing.T) {
-	repo := freshRepository(t)
-	ctx := context.Background()
-	at := sessiontest.At("10:00")
-	evaluatedAt := sessiontest.At("10:01")
-	sessiontest.Login(t, repo, sessiontest.Key("tenant-a", "alice", "192.0.2.10"), firstSessionID, at, "user")
-
+	evaluatedAt := sessiontest.At("11:30")
 	rejected := []struct {
 		name   string
 		filter session.Filter
@@ -141,27 +123,24 @@ func TestQueryRejectsUnsupportedAndInjectionShapedInputs(t *testing.T) {
 		{name: "injected value for a UUID field", filter: sessiontest.Filter("sessionId", "eq", "' OR TRUE --")},
 	}
 	for _, test := range rejected {
-		t.Run(test.name, func(t *testing.T) {
-			_, err := repo.Query(ctx, sessiontest.Spec(evaluatedAt, test.filter))
-			if !errors.Is(err, repository.ErrInvalidQuery) {
-				t.Fatalf("Query() error = %v, want ErrInvalidQuery", err)
-			}
-		})
+		if _, err := repo.Query(ctx, sessiontest.Spec(evaluatedAt, test.filter)); !errors.Is(err, repository.ErrInvalidQuery) {
+			t.Errorf("%s: Query() error = %v, want ErrInvalidQuery", test.name, err)
+		}
 	}
 
-	// An injection-shaped value on a string field is a value, so it matches
-	// nothing and leaves the store intact.
+	// An injection-shaped value on a string field is only ever a value, so it
+	// matches nothing and leaves the store intact.
 	injected := sessiontest.Query(t, repo, sessiontest.Spec(evaluatedAt,
 		sessiontest.Filter("tenantId", "eq", "tenant-a' OR TRUE --"),
 	))
 	if len(injected.Sessions) != 0 {
-		t.Fatalf("matching sessions = %+v, want none", injected.Sessions)
+		t.Errorf("matching sessions = %+v, want none", injected.Sessions)
 	}
 	surviving := sessiontest.Query(t, repo, sessiontest.Spec(evaluatedAt,
 		sessiontest.Filter("tenantId", "eq", "tenant-a"),
 	))
-	if len(surviving.Sessions) != 1 {
-		t.Fatalf("matching sessions after the injection attempts = %+v, want the seeded session", surviving.Sessions)
+	if len(surviving.Sessions) != 2 {
+		t.Errorf("matching sessions after the injection attempts = %+v, want both seeded sessions", surviving.Sessions)
 	}
 }
 

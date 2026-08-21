@@ -31,50 +31,60 @@ func TestEventIDContract(t *testing.T) {
 	repositorytest.EventIDCase().Run(t, freshRepository)
 }
 
-// Two different keys hash to different advisory locks, so unrelated sessions
-// mutate concurrently.
-func TestMutateDifferentKeysDoNotShareAnAdvisoryLock(t *testing.T) {
-	repo := freshRepository(t)
-	rollback := errors.New("do not persist")
-	firstEntered, releaseFirst := make(chan struct{}), make(chan struct{})
-	secondEntered := make(chan struct{})
-	results := make(chan error, 2)
-
-	go func() {
-		results <- repo.Mutate(context.Background(), sessiontest.Key("tenant-a", "alice", "192.0.2.10"),
-			func(session.CurrentSessionSnapshot) (session.Mutation, error) {
-				close(firstEntered)
-				<-releaseFirst
-				return nil, rollback
-			})
-	}()
-	sessiontest.Await(t, firstEntered, "the first key's callback")
-
-	go func() {
-		results <- repo.Mutate(context.Background(), sessiontest.Key("tenant-a", "bob", "192.0.2.10"),
-			func(session.CurrentSessionSnapshot) (session.Mutation, error) {
-				close(secondEntered)
-				return nil, rollback
-			})
-	}()
-	sessiontest.Await(t, secondEntered, "the second key's callback while the first is held")
-	close(releaseFirst)
-
-	for range 2 {
-		if err := <-results; !errors.Is(err, rollback) {
-			t.Fatalf("Mutate() error = %v, want %v", err, rollback)
-		}
-	}
-}
-
-// The callback only runs once the transaction holds the existing session rows,
-// so a concurrent writer cannot change them underneath it.
-func TestMutateLocksExistingSessionRowsBeforeTheCallback(t *testing.T) {
+// Locking is per session key: unrelated keys proceed together, a key whose rows
+// another transaction holds waits for them, and a waiting mutation gives up when
+// its context ends without ever running its callback.
+func TestMutateLockingAndCancellation(t *testing.T) {
 	db := openTestDatabase(t, true)
 	repo := openRepository(t, db)
-	key := sessiontest.Key("tenant-a", "alice", "192.0.2.10")
-	sessiontest.Login(t, repo, key, firstSessionID, sessiontest.At("10:00"), "user")
+	alice := sessiontest.Key("tenant-a", "alice", "192.0.2.10")
+	bob := sessiontest.Key("tenant-a", "bob", "192.0.2.10")
+	rollback := errors.New("do not persist")
 
+	// Different keys hash to different advisory locks.
+	firstEntered, releaseFirst := make(chan struct{}), make(chan struct{})
+	otherEntered := make(chan struct{})
+	results := make(chan error, 2)
+	go func() {
+		results <- repo.Mutate(context.Background(), alice, func(session.CurrentSessionSnapshot) (session.Mutation, error) {
+			close(firstEntered)
+			<-releaseFirst
+			return nil, rollback
+		})
+	}()
+	sessiontest.Await(t, firstEntered, "the first key's callback")
+	go func() {
+		results <- repo.Mutate(context.Background(), bob, func(session.CurrentSessionSnapshot) (session.Mutation, error) {
+			close(otherEntered)
+			return nil, rollback
+		})
+	}()
+	sessiontest.Await(t, otherEntered, "the second key's callback while the first is held")
+
+	// A mutation on the held key waits, and its context deadline releases it.
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	waitingCallbackRan := false
+	err := repo.Mutate(ctx, alice, func(session.CurrentSessionSnapshot) (session.Mutation, error) {
+		waitingCallbackRan = true
+		return nil, rollback
+	})
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("waiting Mutate() error = %v, want context.DeadlineExceeded", err)
+	}
+	if waitingCallbackRan {
+		t.Error("the waiting mutation ran its callback after its context ended")
+	}
+	close(releaseFirst)
+	for range 2 {
+		if err := <-results; !errors.Is(err, rollback) {
+			t.Errorf("Mutate() error = %v, want %v", err, rollback)
+		}
+	}
+
+	// An existing session row locked by another transaction holds the callback
+	// back until that transaction releases it.
+	sessiontest.Login(t, repo, alice, firstSessionID, sessiontest.At("10:00"), "user")
 	locker, err := db.BeginTx(context.Background(), nil)
 	if err != nil {
 		t.Fatalf("BeginTx() error = %v", err)
@@ -85,15 +95,14 @@ func TestMutateLocksExistingSessionRowsBeforeTheCallback(t *testing.T) {
 		SELECT id FROM sessions
 		WHERE tenant_id = $1 AND username = $2 AND ip = $3::inet
 		FOR UPDATE
-	`, key.TenantID, key.Username, key.IP).Scan(&lockedID); err != nil {
+	`, alice.TenantID, alice.Username, alice.IP).Scan(&lockedID); err != nil {
 		t.Fatalf("lock the session row: %v", err)
 	}
 
-	rollback := errors.New("inspection only")
 	callbackEntered := make(chan struct{})
-	result := make(chan error, 1)
+	lockedResult := make(chan error, 1)
 	go func() {
-		result <- repo.Mutate(context.Background(), key, func(session.CurrentSessionSnapshot) (session.Mutation, error) {
+		lockedResult <- repo.Mutate(context.Background(), alice, func(session.CurrentSessionSnapshot) (session.Mutation, error) {
 			close(callbackEntered)
 			return nil, rollback
 		})
@@ -101,84 +110,41 @@ func TestMutateLocksExistingSessionRowsBeforeTheCallback(t *testing.T) {
 	if !sessiontest.Blocked(callbackEntered) {
 		t.Fatal("the callback ran while another transaction held the session row")
 	}
-
 	if err := locker.Rollback(); err != nil {
 		t.Fatalf("release the session row lock: %v", err)
 	}
 	sessiontest.Await(t, callbackEntered, "the callback after the row unlocks")
-	if err := <-result; !errors.Is(err, rollback) {
-		t.Fatalf("Mutate() error = %v, want %v", err, rollback)
+	if err := <-lockedResult; !errors.Is(err, rollback) {
+		t.Errorf("Mutate() error = %v, want %v", err, rollback)
 	}
 }
 
-// A mutation waiting for a same-key lock gives up when its context ends, and
-// never runs its callback.
-func TestMutateHonorsCancellationWhileWaiting(t *testing.T) {
-	repo := freshRepository(t)
-	key := sessiontest.Key("tenant-a", "alice", "192.0.2.10")
-	rollback := errors.New("release lock")
-	firstEntered, releaseFirst := make(chan struct{}), make(chan struct{})
-	firstResult := make(chan error, 1)
-
-	go func() {
-		firstResult <- repo.Mutate(context.Background(), key, func(session.CurrentSessionSnapshot) (session.Mutation, error) {
-			close(firstEntered)
-			<-releaseFirst
-			return nil, rollback
-		})
-	}()
-	sessiontest.Await(t, firstEntered, "the holding callback")
-
-	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
-	defer cancel()
-	waitingCallbackRan := false
-	err := repo.Mutate(ctx, key, func(session.CurrentSessionSnapshot) (session.Mutation, error) {
-		waitingCallbackRan = true
-		return nil, rollback
-	})
-	if !errors.Is(err, context.DeadlineExceeded) {
-		t.Errorf("waiting Mutate() error = %v, want context.DeadlineExceeded", err)
-	}
-	if waitingCallbackRan {
-		t.Error("the waiting mutation ran its callback after its context ended")
-	}
-
-	close(releaseFirst)
-	if err := <-firstResult; !errors.Is(err, rollback) {
-		t.Fatalf("holding Mutate() error = %v, want %v", err, rollback)
-	}
-}
-
-func TestMutatePersistsAcrossRepositoryInstances(t *testing.T) {
+// Committed data outlives the repository that wrote it, a failed write rolls
+// back everything the same transaction had already done, and the snapshot's
+// latest event time comes from the whole lifecycle history.
+func TestMutatePersistenceRollbackAndSnapshot(t *testing.T) {
 	loginAt := sessiontest.At("10:00")
-	first := openRepository(t, openTestDatabase(t, true))
 	key := sessiontest.Key("tenant-a", "alice", "192.0.2.10")
-	sessiontest.Login(t, first, key, firstSessionID, loginAt, "user")
+
+	first := openRepository(t, openTestDatabase(t, true))
+	loginEvent := sessiontest.Login(t, first, key, firstSessionID, loginAt, "user")
 	if err := first.Close(); err != nil {
 		t.Fatalf("first Close() error = %v", err)
 	}
 
-	// A second repository over the same schema sees the committed lifecycle.
-	second := openRepository(t, openTestDatabase(t, false))
-	snapshot := sessiontest.Snapshot(t, second, key)
-	if snapshot.LastEventAt == nil || !snapshot.LastEventAt.Equal(loginAt) {
-		t.Errorf("LastEventAt = %v, want %v", snapshot.LastEventAt, loginAt)
-	}
-	if snapshot.Active == nil || snapshot.Active.ID != firstSessionID {
-		t.Errorf("active session = %+v, want the persisted %q", snapshot.Active, firstSessionID)
-	}
-}
-
-// When persisting the new state fails, the statements already issued in the
-// same transaction are rolled back with it.
-func TestMutateRollsBackWhenPersistenceFails(t *testing.T) {
-	db := openTestDatabase(t, true)
+	db := openTestDatabase(t, false)
 	repo := openRepository(t, db)
-	key := sessiontest.Key("tenant-a", "alice", "192.0.2.10")
-	loginAt := sessiontest.At("10:00")
-	loginEvent := sessiontest.Login(t, repo, key, firstSessionID, loginAt, "user")
-	rejectForcedStates(t, db)
+	persisted := sessiontest.Snapshot(t, repo, key)
+	if persisted.LastEventAt == nil || !persisted.LastEventAt.Equal(loginAt) {
+		t.Errorf("LastEventAt = %v, want %v", persisted.LastEventAt, loginAt)
+	}
+	if persisted.Active == nil || persisted.Active.ID != firstSessionID {
+		t.Errorf("active session = %+v, want the persisted %q", persisted.Active, firstSessionID)
+	}
 
+	// Make the state insert fail, so the update fails after closing the old
+	// state and writing the new event ID in the same transaction.
+	rejectForcedStates(t, db)
 	err := repo.Mutate(context.Background(), key, func(snapshot session.CurrentSessionSnapshot) (session.Mutation, error) {
 		return session.DecideUpdate(snapshot, session.UpdateCommand{
 			EventID: sessiontest.NextEventID(), Key: key,
@@ -189,46 +155,39 @@ func TestMutateRollsBackWhenPersistenceFails(t *testing.T) {
 		t.Fatal("Mutate() error = nil, want the forced persistence failure")
 	}
 
-	// Nothing from the failed update survived: not the closed state, not the
-	// new state, and not the event identity.
-	snapshot := sessiontest.Snapshot(t, repo, key)
-	if snapshot.LastEventAt == nil || !snapshot.LastEventAt.Equal(loginAt) {
-		t.Errorf("LastEventAt = %v, want the login time %v", snapshot.LastEventAt, loginAt)
+	rolledBack := sessiontest.Snapshot(t, repo, key)
+	if rolledBack.LastEventAt == nil || !rolledBack.LastEventAt.Equal(loginAt) {
+		t.Errorf("LastEventAt = %v, want the login time %v", rolledBack.LastEventAt, loginAt)
 	}
-	if snapshot.LastEventID != loginEvent {
-		t.Errorf("LastEventID = %q, want the login event %q", snapshot.LastEventID, loginEvent)
+	if rolledBack.LastEventID != loginEvent {
+		t.Errorf("LastEventID = %q, want the login event %q", rolledBack.LastEventID, loginEvent)
 	}
-	if snapshot.Active == nil || len(snapshot.Active.States) != 1 {
-		t.Fatalf("active session = %+v, want one surviving state", snapshot.Active)
+	if rolledBack.Active == nil || len(rolledBack.Active.States) != 1 {
+		t.Fatalf("active session = %+v, want one surviving state", rolledBack.Active)
 	}
-	if state := snapshot.Active.States[0]; state.ValidTo != nil || !reflect.DeepEqual(state.Tags, []string{"user"}) {
+	if state := rolledBack.Active.States[0]; state.ValidTo != nil || !reflect.DeepEqual(state.Tags, []string{"user"}) {
 		t.Errorf("surviving state = %+v, want the open login state tagged [user]", state)
 	}
-}
 
-// The latest event time comes from the whole lifecycle history, including a
-// state that was closed after the current one began.
-func TestMutateSnapshotIncludesHistoricalStateEnd(t *testing.T) {
-	db := openTestDatabase(t, true)
-	repo := openRepository(t, db)
-	key := sessiontest.Key("tenant-a", "alice", "192.0.2.10")
+	// A state closed after the current one began is still the latest event.
+	historyDB := openTestDatabase(t, true)
+	historyRepo := openRepository(t, historyDB)
 	historicalEnd := sessiontest.At("12:00")
-	execute(t, db, `
+	execute(t, historyDB, `
 		INSERT INTO sessions (id, tenant_id, username, ip, login_at)
 		VALUES ($1::uuid, $2, $3, $4::inet, $5)
 	`, firstSessionID, key.TenantID, key.Username, key.IP, sessiontest.At("10:00"))
-	execute(t, db, `
+	execute(t, historyDB, `
 		INSERT INTO session_states (session_id, tags, valid_from, valid_to)
 		VALUES ($1::uuid, ARRAY['user'], $2, $3)
 	`, firstSessionID, sessiontest.At("10:00"), historicalEnd)
-	execute(t, db, `
+	execute(t, historyDB, `
 		INSERT INTO session_states (session_id, tags, valid_from)
 		VALUES ($1::uuid, ARRAY['admin'], $2)
 	`, firstSessionID, sessiontest.At("11:00"))
 
-	got := sessiontest.Snapshot(t, repo, key).LastEventAt
-	if got == nil || !got.Equal(historicalEnd) {
-		t.Fatalf("LastEventAt = %v, want the historical valid_to %v", got, historicalEnd)
+	if got := sessiontest.Snapshot(t, historyRepo, key).LastEventAt; got == nil || !got.Equal(historicalEnd) {
+		t.Errorf("LastEventAt = %v, want the historical valid_to %v", got, historicalEnd)
 	}
 }
 
@@ -244,12 +203,11 @@ func runContractCases(t *testing.T, names ...string) {
 			continue
 		}
 		delete(wanted, contractCase.Name)
-		t.Run(contractCase.Name, func(t *testing.T) {
-			contractCase.Run(t, freshRepository)
-		})
+		t.Logf("contract requirement: %s", contractCase.Name)
+		contractCase.Run(t, freshRepository)
 	}
 	for name := range wanted {
-		t.Fatalf("contract case %q is no longer defined", name)
+		t.Errorf("contract case %q is no longer defined", name)
 	}
 }
 
