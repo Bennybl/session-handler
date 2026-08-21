@@ -19,148 +19,83 @@ import (
 	"github.com/Bennybl/session-handler/internal/repository/memory"
 	postgresrepository "github.com/Bennybl/session-handler/internal/repository/postgres"
 	"github.com/Bennybl/session-handler/internal/service"
+	"github.com/Bennybl/session-handler/internal/sessiontest"
 	_ "github.com/jackc/pgx/v5/stdlib"
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
 )
 
-const forcedRollbackEventID = "a1000000-0000-4000-8000-000000000007"
-
+// The durable path must reproduce the memory and stdin snapshot exactly, while
+// also surviving a crash between the database commit and the acknowledgement,
+// dead-lettering an impossible event, and outliving the process that wrote it.
 func TestPostgresNATSMatchesMemoryStdinAndSurvivesRedeliveryRestart(t *testing.T) {
 	databaseURL := requireEnvironment(t, "TEST_DATABASE_URL")
 	natsURL := requireEnvironment(t, "TEST_NATS_URL")
+	want := memoryStdinSnapshot(t)
 
-	memoryRepository := memory.New()
-	memoryHarness := newApplicationHarness(t, memoryRepository, fixtureIDGenerator(t))
-	consumeStdin(t, memoryHarness.service, fixtureEvents(), &recordingDeadLetters{})
-	want := exerciseHTTPQueries(t, memoryHarness.handler)
-	if err := memoryRepository.Close(); err != nil {
-		t.Fatalf("close baseline memory repository: %v", err)
-	}
+	repo, _, schemaURL := newPostgresRepository(t, databaseURL)
+	harness := newApplicationHarness(t, repo, fixtureIDGenerator(t))
+	stream := newNATSStream(t, natsURL)
 
-	postgresRepository, _, schemaURL := newPostgresRepository(t, databaseURL)
-	postgresHarness := newApplicationHarness(t, postgresRepository, fixtureIDGenerator(t))
-	connection, err := nats.Connect(natsURL)
-	if err != nil {
-		t.Fatalf("connect to NATS: %v", err)
+	// Commit Alice's login to PostgreSQL, then stop before acknowledging it.
+	login := fixtureEvents()[0]
+	stream.publish(t, login)
+	stream.commitFirstWithoutAcknowledging(t, harness)
+
+	// Restarting redelivers that login, which must be recognized as already
+	// applied rather than opening a second lifecycle.
+	observed, stopConsumer := stream.consume(t, harness, encodeEvent(t, login))
+	stream.publish(t, fixtureEvents()[2:]...)
+
+	// The trailing update has no active session and can never succeed.
+	deadLetter := stream.nextDeadLetter(t)
+	if !strings.Contains(deadLetter.Reason, "invalid transition") {
+		t.Errorf("dead letter reason = %q, want it to name an invalid transition", deadLetter.Reason)
 	}
-	t.Cleanup(connection.Close)
-	js, err := jetstream.New(connection)
-	if err != nil {
-		t.Fatalf("jetstream.New() error = %v", err)
-	}
-	configuration := integrationNATSConfig(t)
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer cancel()
-	firstSource, err := eventstream.NewNATSSource(ctx, connection, configuration)
-	if err != nil {
-		t.Fatalf("first NewNATSSource() error = %v", err)
-	}
-	t.Cleanup(func() { _ = js.DeleteStream(context.Background(), configuration.StreamName) })
-	dlqSubscription, err := connection.SubscribeSync(configuration.DeadLetterSubject)
-	if err != nil {
-		t.Fatalf("subscribe to DLQ: %v", err)
-	}
-	if err := connection.Flush(); err != nil {
-		t.Fatalf("flush DLQ subscription: %v", err)
+	if !strings.Contains(string(deadLetter.Payload), invalidUpdateEventID) {
+		t.Errorf("dead letter payload = %s, want the invalid update %q", deadLetter.Payload, invalidUpdateEventID)
 	}
 
-	loginPayload := encodeEvent(t, fixtureEvents()[0])
-	if _, err := js.Publish(ctx, configuration.Subject, loginPayload); err != nil {
-		t.Fatalf("publish crash-window login: %v", err)
-	}
-	unacknowledged, err := firstSource.Next(ctx)
-	if err != nil {
-		t.Fatalf("fetch crash-window login: %v", err)
-	}
-	decoded, err := eventstream.DecodeEvent(unacknowledged.Data())
-	if err != nil {
-		t.Fatalf("decode crash-window login: %v", err)
-	}
-	if err := postgresHarness.service.ApplyEvent(ctx, decoded); err != nil {
-		t.Fatalf("commit crash-window login: %v", err)
-	}
-	if err := firstSource.Close(); err != nil {
-		t.Fatalf("close unacknowledged source: %v", err)
-	}
-
-	restartedSource, err := eventstream.NewNATSSource(ctx, connection, configuration)
-	if err != nil {
-		t.Fatalf("restart NewNATSSource() error = %v", err)
-	}
-	observed := &observingSource{Source: restartedSource, loginPayload: loginPayload}
-	consumer, err := eventstream.NewConsumer(observed, postgresHarness.service, restartedSource, eventstream.Options{RetryDelay: 2 * time.Second})
-	if err != nil {
-		t.Fatalf("NewConsumer() error = %v", err)
-	}
-	consumerContext, stopConsumer := context.WithCancel(context.Background())
-	t.Cleanup(stopConsumer)
-	t.Cleanup(func() { _ = restartedSource.Close() })
-	consumerResult := make(chan error, 1)
-	go func() { consumerResult <- consumer.Run(consumerContext) }()
-
-	for _, event := range fixtureEvents()[2:] {
-		if _, err := js.Publish(ctx, configuration.Subject, encodeEvent(t, event)); err != nil {
-			t.Fatalf("publish event %s: %v", event.EventID, err)
-		}
-	}
-	dlqMessage, err := dlqSubscription.NextMsg(10 * time.Second)
-	if err != nil {
-		t.Fatalf("wait for invalid-transition DLQ: %v", err)
-	}
-	var deadLetter eventstream.DeadLetter
-	if err := json.Unmarshal(dlqMessage.Data, &deadLetter); err != nil {
-		t.Fatalf("decode DLQ: %v", err)
-	}
-	if !strings.Contains(deadLetter.Reason, "invalid transition") || !strings.Contains(string(deadLetter.Payload), invalidUpdateEventID) {
-		t.Fatalf("dead letter = %+v", deadLetter)
-	}
-	waitFor(t, "NATS acknowledgements and termination", func() bool {
+	waitUntil(t, "every message to be acknowledged or terminated", func() bool {
 		return observed.acknowledged.Load() == 5 && observed.terminated.Load() == 1
 	})
-	durable, err := js.Consumer(ctx, configuration.StreamName, configuration.ConsumerName)
-	if err != nil {
-		t.Fatalf("load durable consumer: %v", err)
+	stream.waitForEmptyBacklog(t)
+	if got := observed.redeliveredLoginAcks.Load(); got != 1 {
+		t.Errorf("acknowledgements of the redelivered login = %d, want exactly 1", got)
 	}
-	waitFor(t, "empty durable backlog", func() bool {
-		info, infoError := durable.Info(context.Background())
-		return infoError == nil && info.NumAckPending == 0 && info.NumPending == 0
-	})
-	if observed.redeliveredLoginAcks.Load() != 1 {
-		t.Fatalf("redelivered login acknowledgements = %d, want 1", observed.redeliveredLoginAcks.Load())
+	if got := exerciseHTTPQueries(t, harness.handler); !reflect.DeepEqual(got, want) {
+		t.Fatalf("PostgreSQL and NATS snapshot = %+v, want the memory and stdin snapshot %+v", got, want)
 	}
-	if got := exerciseHTTPQueries(t, postgresHarness.handler); !reflect.DeepEqual(got, want) {
-		t.Fatalf("PostgreSQL/NATS snapshot = %+v, memory/stdin snapshot = %+v", got, want)
+	stopConsumer(t)
+	if err := repo.Close(); err != nil {
+		t.Fatalf("close the first PostgreSQL repository: %v", err)
 	}
 
-	stopConsumer()
-	if err := <-consumerResult; !errors.Is(err, context.Canceled) {
-		t.Fatalf("consumer shutdown error = %v", err)
-	}
-	if err := restartedSource.Close(); err != nil {
-		t.Fatalf("close restarted source: %v", err)
-	}
-	if err := postgresRepository.Close(); err != nil {
-		t.Fatalf("close first PostgreSQL repository: %v", err)
-	}
-
-	persistedRepository, persistedDatabase := openExistingPostgresRepository(t, schemaURL)
-	persistedHarness := newApplicationHarness(t, persistedRepository, concurrentIDGenerator())
+	// The data outlives the repository that wrote it.
+	persisted, persistedDatabase := openPostgresRepository(t, schemaURL)
+	persistedHarness := newApplicationHarness(t, persisted, concurrentIDGenerator())
 	if got := exerciseHTTPQueries(t, persistedHarness.handler); !reflect.DeepEqual(got, want) {
-		t.Fatalf("persisted PostgreSQL snapshot = %+v, want %+v", got, want)
+		t.Fatalf("snapshot after reopening PostgreSQL = %+v, want %+v", got, want)
 	}
-	assertPersistenceRollback(t, ctx, js, connection, configuration, persistedHarness, persistedDatabase)
+	assertRollbackLeavesSessionUnchanged(t, stream, persistedHarness, persistedDatabase)
 }
 
-func assertPersistenceRollback(
-	t *testing.T,
-	ctx context.Context,
-	js jetstream.JetStream,
-	connection *nats.Conn,
-	configuration eventstream.NATSConfig,
-	harness applicationHarness,
-	database *sql.DB,
-) {
+// memoryStdinSnapshot is the baseline the durable path must reproduce.
+func memoryStdinSnapshot(t *testing.T) querySnapshot {
+	t.Helper()
+	repo := memory.New()
+	harness := newApplicationHarness(t, repo, fixtureIDGenerator(t))
+	consumeStdin(t, harness.service, fixtureEvents(), &recordingDeadLetters{})
+	snapshot := exerciseHTTPQueries(t, harness.handler)
+	if err := repo.Close(); err != nil {
+		t.Fatalf("close the baseline memory repository: %v", err)
+	}
+	return snapshot
+}
+
+// A failed PostgreSQL write must leave the session untouched and the message
+// scheduled for a later retry rather than acknowledged.
+func assertRollbackLeavesSessionUnchanged(t *testing.T, stream *natsStream, harness applicationHarness, database *sql.DB) {
 	t.Helper()
 	if _, err := database.Exec(`
 		CREATE FUNCTION reject_integration_state() RETURNS trigger LANGUAGE plpgsql AS $$
@@ -175,60 +110,197 @@ func assertPersistenceRollback(
 			BEFORE INSERT ON session_states
 			FOR EACH ROW EXECUTE FUNCTION reject_integration_state();
 	`); err != nil {
-		t.Fatalf("install rollback trigger: %v", err)
+		t.Fatalf("install the rollback trigger: %v", err)
 	}
-	source, err := eventstream.NewNATSSource(ctx, connection, configuration)
-	if err != nil {
-		t.Fatalf("rollback NewNATSSource() error = %v", err)
-	}
-	observed := &observingSource{Source: source}
-	consumer, err := eventstream.NewConsumer(observed, harness.service, source, eventstream.Options{RetryDelay: 5 * time.Second})
-	if err != nil {
-		t.Fatalf("rollback NewConsumer() error = %v", err)
-	}
-	consumerContext, cancelConsumer := context.WithCancel(context.Background())
-	t.Cleanup(cancelConsumer)
-	t.Cleanup(func() { _ = source.Close() })
-	result := make(chan error, 1)
-	go func() { result <- consumer.Run(consumerContext) }()
-	rollbackEvent := service.Event{
-		EventID: forcedRollbackEventID, Type: service.EventUpdate, TenantID: "tenant-a", Username: "bob",
-		IP: "192.0.2.10", Tags: []string{"force-db-error"}, Timestamp: time.Date(2026, 8, 21, 13, 0, 0, 0, time.UTC),
-	}
-	if _, err := js.Publish(ctx, configuration.Subject, encodeEvent(t, rollbackEvent)); err != nil {
-		t.Fatalf("publish rollback event: %v", err)
-	}
-	waitFor(t, "delayed retry after PostgreSQL rollback", func() bool { return observed.negativeAcknowledgements.Load() == 1 })
+
+	observed, stopConsumer := stream.consume(t, harness, nil)
+	stream.publish(t, service.Event{
+		EventID: sessiontest.EventID(1307), Type: service.EventUpdate,
+		TenantID: "tenant-a", Username: "bob", IP: "192.0.2.10",
+		Tags: []string{"force-db-error"}, Timestamp: sessiontest.At("13:00"),
+	})
+
+	waitUntil(t, "the delayed retry after the PostgreSQL rollback", func() bool {
+		return observed.negativeAcknowledgements.Load() == 1
+	})
 	bob := queryHTTP(t, harness.handler, map[string]any{"filters": []any{
-		map[string]any{"field": "sessionId", "operator": "eq", "value": bobSessionID},
+		filter("sessionId", "eq", bobSessionID),
 	}})
-	if len(bob.Sessions) != 1 || len(bob.Sessions[0].States) != 1 || !reflect.DeepEqual(bob.Sessions[0].States[0].Tags, []string{"user"}) {
-		t.Fatalf("Bob after rolled-back state insert = %+v", bob.Sessions)
+	if len(bob.Sessions) != 1 {
+		t.Fatalf("Bob's sessions = %+v, want 1", bob.Sessions)
 	}
-	cancelConsumer()
-	if err := <-result; !errors.Is(err, context.Canceled) {
-		t.Fatalf("rollback consumer shutdown error = %v", err)
+	if len(bob.Sessions[0].States) != 1 {
+		t.Fatalf("Bob's states = %+v, want the rolled-back insert to add none", bob.Sessions[0].States)
 	}
-	if err := source.Close(); err != nil {
-		t.Fatalf("close rollback source: %v", err)
+	if want := []string{"user"}; !reflect.DeepEqual(bob.Sessions[0].States[0].Tags, want) {
+		t.Fatalf("Bob's tags = %v, want the original %v", bob.Sessions[0].States[0].Tags, want)
+	}
+	stopConsumer(t)
+}
+
+// natsStream owns one uniquely named JetStream stream, its durable consumer,
+// and a subscription to its dead-letter subject.
+type natsStream struct {
+	connection  *nats.Conn
+	jetStream   jetstream.JetStream
+	config      eventstream.NATSConfig
+	first       *eventstream.NATSSource
+	deadLetters *nats.Subscription
+}
+
+func newNATSStream(t *testing.T, url string) *natsStream {
+	t.Helper()
+	connection, err := nats.Connect(url)
+	if err != nil {
+		t.Fatalf("connect to NATS: %v", err)
+	}
+	t.Cleanup(connection.Close)
+	jetStream, err := jetstream.New(connection)
+	if err != nil {
+		t.Fatalf("jetstream.New() error = %v", err)
+	}
+
+	// A unique name per run keeps repeated runs from sharing broker state.
+	unique := fmt.Sprintf("%d", time.Now().UnixNano())
+	config := eventstream.NATSConfig{
+		StreamName: "INTEGRATION_" + unique, Subject: "integration." + unique + ".events",
+		ConsumerName: "integration_" + unique, DeadLetterSubject: "integration." + unique + ".dlq",
+		MaxAge: time.Hour, MaxMessages: 1_000, MaxBytes: 8 * 1024 * 1024, MaxMessageBytes: 1024 * 1024,
+		AckWait: 300 * time.Millisecond, FetchMaxWait: 100 * time.Millisecond,
+	}
+	stream := &natsStream{connection: connection, jetStream: jetStream, config: config}
+
+	// Opening the first source creates the stream and durable consumer.
+	stream.first = stream.openSource(t)
+	t.Cleanup(func() { _ = jetStream.DeleteStream(context.Background(), config.StreamName) })
+
+	stream.deadLetters, err = connection.SubscribeSync(config.DeadLetterSubject)
+	if err != nil {
+		t.Fatalf("subscribe to the dead-letter subject: %v", err)
+	}
+	if err := connection.Flush(); err != nil {
+		t.Fatalf("flush the dead-letter subscription: %v", err)
+	}
+	return stream
+}
+
+func (s *natsStream) openSource(t *testing.T) *eventstream.NATSSource {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	source, err := eventstream.NewNATSSource(ctx, s.connection, s.config)
+	if err != nil {
+		t.Fatalf("NewNATSSource() error = %v", err)
+	}
+	t.Cleanup(func() { _ = source.Close() })
+	return source
+}
+
+func (s *natsStream) publish(t *testing.T, events ...service.Event) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	for _, event := range events {
+		if _, err := s.jetStream.Publish(ctx, s.config.Subject, encodeEvent(t, event)); err != nil {
+			t.Fatalf("publish event %s: %v", event.EventID, err)
+		}
 	}
 }
 
+// commitFirstWithoutAcknowledging applies one message and then drops the source,
+// reproducing a crash between the database commit and the acknowledgement.
+func (s *natsStream) commitFirstWithoutAcknowledging(t *testing.T, harness applicationHarness) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	message, err := s.first.Next(ctx)
+	if err != nil {
+		t.Fatalf("fetch the message to commit: %v", err)
+	}
+	event, err := eventstream.DecodeEvent(message.Data())
+	if err != nil {
+		t.Fatalf("decode the message to commit: %v", err)
+	}
+	if err := harness.service.ApplyEvent(ctx, event); err != nil {
+		t.Fatalf("commit the message: %v", err)
+	}
+	if err := s.first.Close(); err != nil {
+		t.Fatalf("close the source before acknowledging: %v", err)
+	}
+}
+
+// consume runs a consumer over a fresh source until the returned stop function
+// is called. Pass the payload whose acknowledgements should be counted, or nil.
+func (s *natsStream) consume(t *testing.T, harness applicationHarness, watched []byte) (*observingSource, func(*testing.T)) {
+	t.Helper()
+	source := s.openSource(t)
+	observed := &observingSource{Source: source, watchedPayload: watched}
+	consumer, err := eventstream.NewConsumer(observed, harness.service, source, eventstream.Options{RetryDelay: 2 * time.Second})
+	if err != nil {
+		t.Fatalf("NewConsumer() error = %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	result := make(chan error, 1)
+	go func() { result <- consumer.Run(ctx) }()
+
+	return observed, func(t *testing.T) {
+		t.Helper()
+		cancel()
+		if err := <-result; !errors.Is(err, context.Canceled) {
+			t.Errorf("consumer shutdown error = %v, want context.Canceled", err)
+		}
+		if err := source.Close(); err != nil {
+			t.Errorf("close the consumer source: %v", err)
+		}
+	}
+}
+
+func (s *natsStream) nextDeadLetter(t *testing.T) eventstream.DeadLetter {
+	t.Helper()
+	message, err := s.deadLetters.NextMsg(10 * time.Second)
+	if err != nil {
+		t.Fatalf("wait for a dead letter: %v", err)
+	}
+	var letter eventstream.DeadLetter
+	if err := json.Unmarshal(message.Data, &letter); err != nil {
+		t.Fatalf("decode the dead letter %s: %v", message.Data, err)
+	}
+	return letter
+}
+
+func (s *natsStream) waitForEmptyBacklog(t *testing.T) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	durable, err := s.jetStream.Consumer(ctx, s.config.StreamName, s.config.ConsumerName)
+	if err != nil {
+		t.Fatalf("load the durable consumer: %v", err)
+	}
+	waitUntil(t, "the durable consumer backlog to drain", func() bool {
+		info, err := durable.Info(context.Background())
+		return err == nil && info.NumAckPending == 0 && info.NumPending == 0
+	})
+}
+
+// observingSource counts how each message it hands out was disposed of.
 type observingSource struct {
 	eventstream.Source
-	loginPayload             []byte
+	watchedPayload           []byte
 	acknowledged             atomic.Int64
 	redeliveredLoginAcks     atomic.Int64
 	negativeAcknowledgements atomic.Int64
 	terminated               atomic.Int64
 }
 
-func (source *observingSource) Next(ctx context.Context) (eventstream.Message, error) {
-	message, err := source.Source.Next(ctx)
+func (s *observingSource) Next(ctx context.Context) (eventstream.Message, error) {
+	message, err := s.Source.Next(ctx)
 	if err != nil {
 		return nil, err
 	}
-	return &observingMessage{Message: message, source: source}, nil
+	return &observingMessage{Message: message, source: s}, nil
 }
 
 type observingMessage struct {
@@ -236,75 +308,68 @@ type observingMessage struct {
 	source *observingSource
 }
 
-func (message *observingMessage) Ack(ctx context.Context) error {
-	if err := message.Message.Ack(ctx); err != nil {
+func (m *observingMessage) Ack(ctx context.Context) error {
+	if err := m.Message.Ack(ctx); err != nil {
 		return err
 	}
-	message.source.acknowledged.Add(1)
-	if len(message.source.loginPayload) > 0 && reflect.DeepEqual(message.Data(), message.source.loginPayload) {
-		message.source.redeliveredLoginAcks.Add(1)
+	m.source.acknowledged.Add(1)
+	if len(m.source.watchedPayload) > 0 && reflect.DeepEqual(m.Data(), m.source.watchedPayload) {
+		m.source.redeliveredLoginAcks.Add(1)
 	}
 	return nil
 }
 
-func (message *observingMessage) NakWithDelay(delay time.Duration) error {
-	if err := message.Message.NakWithDelay(delay); err != nil {
+func (m *observingMessage) NakWithDelay(delay time.Duration) error {
+	if err := m.Message.NakWithDelay(delay); err != nil {
 		return err
 	}
-	message.source.negativeAcknowledgements.Add(1)
+	m.source.negativeAcknowledgements.Add(1)
 	return nil
 }
 
-func (message *observingMessage) Term() error {
-	if err := message.Message.Term(); err != nil {
+func (m *observingMessage) Term() error {
+	if err := m.Message.Term(); err != nil {
 		return err
 	}
-	message.source.terminated.Add(1)
+	m.source.terminated.Add(1)
 	return nil
 }
 
-func integrationNATSConfig(t *testing.T) eventstream.NATSConfig {
-	t.Helper()
-	unique := fmt.Sprintf("%d", time.Now().UnixNano())
-	return eventstream.NATSConfig{
-		StreamName: "INTEGRATION_" + unique, Subject: "integration." + unique + ".events",
-		ConsumerName: "integration_" + unique, DeadLetterSubject: "integration." + unique + ".dlq",
-		MaxAge: time.Hour, MaxMessages: 1_000, MaxBytes: 8 * 1024 * 1024, MaxMessageBytes: 1024 * 1024,
-		AckWait: 300 * time.Millisecond, FetchMaxWait: 100 * time.Millisecond,
-	}
-}
-
+// newPostgresRepository creates a schema unique to this run, migrates it, and
+// drops it when the test ends.
 func newPostgresRepository(t *testing.T, databaseURL string) (*postgresrepository.Repository, *sql.DB, string) {
 	t.Helper()
 	schema := fmt.Sprintf("session_handler_integration_%d", time.Now().UnixNano())
-	admin, err := sql.Open("pgx", databaseURL)
-	if err != nil {
-		t.Fatalf("open PostgreSQL admin connection: %v", err)
-	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
+
+	admin, err := sql.Open("pgx", databaseURL)
+	if err != nil {
+		t.Fatalf("open the PostgreSQL administrative connection: %v", err)
+	}
 	if err := admin.PingContext(ctx); err != nil {
 		_ = admin.Close()
 		t.Fatalf("connect to PostgreSQL: %v", err)
 	}
 	if _, err := admin.ExecContext(ctx, `CREATE SCHEMA `+schema); err != nil {
 		_ = admin.Close()
-		t.Fatalf("create integration schema: %v", err)
+		t.Fatalf("create the integration schema: %v", err)
 	}
 	if err := admin.Close(); err != nil {
-		t.Fatalf("close PostgreSQL admin connection: %v", err)
+		t.Fatalf("close the PostgreSQL administrative connection: %v", err)
 	}
 	t.Cleanup(func() {
-		cleanup, openError := sql.Open("pgx", databaseURL)
-		if openError != nil {
-			t.Errorf("open PostgreSQL cleanup connection: %v", openError)
+		cleanup, err := sql.Open("pgx", databaseURL)
+		if err != nil {
+			t.Errorf("open the PostgreSQL cleanup connection: %v", err)
 			return
 		}
 		defer cleanup.Close()
-		if _, dropError := cleanup.Exec(`DROP SCHEMA IF EXISTS ` + schema + ` CASCADE`); dropError != nil {
-			t.Errorf("drop integration schema: %v", dropError)
+		if _, err := cleanup.Exec(`DROP SCHEMA IF EXISTS ` + schema + ` CASCADE`); err != nil {
+			t.Errorf("drop the integration schema: %v", err)
 		}
 	})
+
 	parsed, err := url.Parse(databaseURL)
 	if err != nil {
 		t.Fatalf("parse TEST_DATABASE_URL: %v", err)
@@ -312,23 +377,24 @@ func newPostgresRepository(t *testing.T, databaseURL string) (*postgresrepositor
 	parameters := parsed.Query()
 	parameters.Set("search_path", schema)
 	parsed.RawQuery = parameters.Encode()
-	repo, database := openExistingPostgresRepository(t, parsed.String())
+
+	repo, database := openPostgresRepository(t, parsed.String())
 	if err := migrations.Apply(ctx, database); err != nil {
-		t.Fatalf("apply integration migrations: %v", err)
+		t.Fatalf("apply the integration migrations: %v", err)
 	}
 	return repo, database, parsed.String()
 }
 
-func openExistingPostgresRepository(t *testing.T, databaseURL string) (*postgresrepository.Repository, *sql.DB) {
+func openPostgresRepository(t *testing.T, databaseURL string) (*postgresrepository.Repository, *sql.DB) {
 	t.Helper()
 	database, err := sql.Open("pgx", databaseURL)
 	if err != nil {
-		t.Fatalf("open integration PostgreSQL: %v", err)
+		t.Fatalf("open the integration database: %v", err)
 	}
 	database.SetMaxOpenConns(20)
 	if err := database.PingContext(context.Background()); err != nil {
 		_ = database.Close()
-		t.Fatalf("connect to integration PostgreSQL: %v", err)
+		t.Fatalf("connect to the integration database: %v", err)
 	}
 	repo, err := postgresrepository.New(database)
 	if err != nil {

@@ -1,55 +1,60 @@
-package session
+package session_test
 
 import (
 	"testing"
 	"time"
+
+	"github.com/Bennybl/session-handler/internal/session"
+	"github.com/Bennybl/session-handler/internal/sessiontest"
 )
 
 func TestIntervalContainsUsesHalfOpenBounds(t *testing.T) {
 	t.Parallel()
 
-	from := mustTime(t, "2026-08-21T10:00:00Z")
-	to := mustTime(t, "2026-08-21T11:00:00Z")
-	interval := Interval{From: from, To: &to}
+	from, to := sessiontest.At("10:00"), sessiontest.At("11:00")
+	interval := session.Interval{From: from, To: &to}
 
-	if interval.Contains(from.Add(-time.Nanosecond)) {
-		t.Fatal("interval contains a value before its lower bound")
+	tests := []struct {
+		name string
+		at   time.Time
+		want bool
+	}{
+		{name: "before lower bound", at: from.Add(-time.Nanosecond), want: false},
+		{name: "at lower bound", at: from, want: true},
+		{name: "before upper bound", at: to.Add(-time.Nanosecond), want: true},
+		{name: "at upper bound", at: to, want: false},
 	}
-	if !interval.Contains(from) {
-		t.Fatal("interval must include its lower bound")
-	}
-	if !interval.Contains(to.Add(-time.Nanosecond)) {
-		t.Fatal("interval must contain a value before its upper bound")
-	}
-	if interval.Contains(to) {
-		t.Fatal("interval must exclude its upper bound")
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			if got := interval.Contains(test.at); got != test.want {
+				t.Fatalf("Contains(%v) = %v, want %v", test.at, got, test.want)
+			}
+		})
 	}
 }
 
 func TestIntervalOverlapUsesHalfOpenBoundsAndSupportsOpenRanges(t *testing.T) {
 	t.Parallel()
 
-	ten := mustTime(t, "2026-08-21T10:00:00Z")
-	eleven := mustTime(t, "2026-08-21T11:00:00Z")
-	twelve := mustTime(t, "2026-08-21T12:00:00Z")
-	interval := Interval{From: ten, To: &eleven}
+	ten, eleven, twelve := sessiontest.At("10:00"), sessiontest.At("11:00"), sessiontest.At("12:00")
+	interval := session.Interval{From: ten, To: &eleven}
 
 	tests := []struct {
-		name       string
-		rangeValue TimeRange
-		want       bool
+		name  string
+		query session.TimeRange
+		want  bool
 	}{
-		{name: "overlap", rangeValue: TimeRange{From: timePointer(ten.Add(30 * time.Minute)), To: &twelve}, want: true},
-		{name: "touching upper bound", rangeValue: TimeRange{From: &eleven, To: &twelve}, want: false},
-		{name: "open before", rangeValue: TimeRange{To: timePointer(ten.Add(time.Minute))}, want: true},
-		{name: "open after", rangeValue: TimeRange{From: timePointer(ten.Add(time.Minute))}, want: true},
+		{name: "overlapping range", query: timeRange(ten.Add(30*time.Minute), twelve), want: true},
+		{name: "starting at the upper bound", query: timeRange(eleven, twelve), want: false},
+		{name: "open before", query: session.TimeRange{To: sessiontest.Ptr(ten.Add(time.Minute))}, want: true},
+		{name: "open after", query: session.TimeRange{From: sessiontest.Ptr(ten.Add(time.Minute))}, want: true},
 	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()
-			if got := interval.Overlaps(tt.rangeValue); got != tt.want {
-				t.Fatalf("Overlaps() = %v, want %v", got, tt.want)
+			if got := interval.Overlaps(test.query); got != test.want {
+				t.Fatalf("Overlaps(%+v) = %v, want %v", test.query, got, test.want)
 			}
 		})
 	}
@@ -58,25 +63,36 @@ func TestIntervalOverlapUsesHalfOpenBoundsAndSupportsOpenRanges(t *testing.T) {
 func TestGenericQueryAndPaginationTypes(t *testing.T) {
 	t.Parallel()
 
-	evaluatedAt := mustTime(t, "2026-08-21T10:00:00Z")
-	spec := QuerySpec{
-		Filters: []Filter{
-			{Field: Field("tenantId"), Operator: Operator("eq"), Value: "tenant-a"},
-			{Field: Field("tags"), Operator: Operator("containsAll"), Value: []string{"admin"}},
+	evaluatedAt := sessiontest.At("10:00")
+	page := session.PageRequest{Limit: 25, Cursor: "cursor"}
+	spec := session.QuerySpec{
+		Filters: []session.Filter{
+			sessiontest.Filter("tenantId", "eq", "tenant-a"),
+			sessiontest.Filter("tags", "containsAll", []string{"admin"}),
 		},
-		Page:        PageRequest{Limit: 25, Cursor: "cursor"},
+		Page:        page,
 		EvaluatedAt: evaluatedAt,
 	}
 
-	if len(spec.Filters) != 2 || spec.Page.Limit != 25 || spec.Page.Cursor != "cursor" {
-		t.Fatalf("unexpected query spec: %+v", spec)
+	if len(spec.Filters) != 2 {
+		t.Errorf("filters = %d, want 2", len(spec.Filters))
+	}
+	if spec.Page != page {
+		t.Errorf("page = %+v, want %+v", spec.Page, page)
 	}
 	if !spec.EvaluatedAt.Equal(evaluatedAt) {
-		t.Fatalf("EvaluatedAt = %v, want %v", spec.EvaluatedAt, evaluatedAt)
+		t.Errorf("EvaluatedAt = %v, want %v", spec.EvaluatedAt, evaluatedAt)
 	}
 
-	result := QueryResult{Sessions: []Session{{ID: "session-1"}}, NextCursor: "next"}
-	if len(result.Sessions) != 1 || result.NextCursor != "next" {
-		t.Fatalf("unexpected query result: %+v", result)
+	result := session.QueryResult{
+		Sessions:   []session.Session{{ID: sessiontest.SessionID(1)}},
+		NextCursor: "next",
 	}
+	if len(result.Sessions) != 1 || result.NextCursor != "next" {
+		t.Errorf("result = %+v, want one session and cursor %q", result, "next")
+	}
+}
+
+func timeRange(from, to time.Time) session.TimeRange {
+	return session.TimeRange{From: &from, To: &to}
 }

@@ -3,6 +3,7 @@ package eventstream
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"reflect"
 	"testing"
@@ -11,175 +12,190 @@ import (
 	"github.com/Bennybl/session-handler/internal/repository/memory"
 	"github.com/Bennybl/session-handler/internal/service"
 	"github.com/Bennybl/session-handler/internal/session"
+	"github.com/Bennybl/session-handler/internal/sessiontest"
 )
 
+// A message is acknowledged only once the repository has committed it, so a
+// crash before the commit leaves the message to be redelivered.
 func TestConsumerAcknowledgesOnlyAfterSuccessfulApplication(t *testing.T) {
 	t.Parallel()
-	order := []string{}
-	message := &messageStub{data: validEventJSON(), ack: func(context.Context) error {
-		order = append(order, "ack")
-		return nil
-	}}
-	source := &sourceStub{messages: []Message{message}}
-	applier := applierFunc(func(context.Context, service.Event) error {
-		order = append(order, "apply")
-		return nil
-	})
 
-	consumer := mustConsumer(t, source, applier, nil, Options{})
+	steps := &journal{}
+	message := newMessage(steps, validEventJSON())
+	consumer := newConsumer(t, &sourceStub{messages: []Message{message}}, appliesWith(steps, nil), nil, Options{})
+
 	if err := consumer.Run(context.Background()); err != nil {
 		t.Fatalf("Run() error = %v", err)
 	}
-	if !reflect.DeepEqual(order, []string{"apply", "ack"}) {
-		t.Fatalf("operation order = %v, want apply then ack", order)
-	}
-	if message.acks != 1 || message.naks != 0 || message.terms != 0 {
-		t.Fatalf("message dispositions = ack %d nak %d term %d", message.acks, message.naks, message.terms)
+	if want := []string{"apply", "ack"}; !reflect.DeepEqual(steps.steps, want) {
+		t.Fatalf("operations = %v, want %v", steps.steps, want)
 	}
 }
 
 func TestConsumerAcknowledgesSuccessfulDuplicate(t *testing.T) {
 	t.Parallel()
-	message := &messageStub{data: validEventJSON()}
-	source := &sourceStub{messages: []Message{message}}
-	applier := applierFunc(func(context.Context, service.Event) error { return nil })
-	consumer := mustConsumer(t, source, applier, nil, Options{})
+
+	// The service reports a repeated event as a success, and the consumer must
+	// treat that like any other success rather than retrying it.
+	steps := &journal{}
+	message := newMessage(steps, validEventJSON())
+	consumer := newConsumer(t, &sourceStub{messages: []Message{message}}, appliesWith(steps, nil), nil, Options{})
+
 	if err := consumer.Run(context.Background()); err != nil {
 		t.Fatalf("Run() error = %v", err)
 	}
-	if message.acks != 1 {
-		t.Fatalf("duplicate acknowledgements = %d, want 1", message.acks)
+	if want := []string{"apply", "ack"}; !reflect.DeepEqual(steps.steps, want) {
+		t.Fatalf("operations = %v, want %v", steps.steps, want)
 	}
 }
 
+// Redelivering an already applied event acknowledges it without opening a
+// second lifecycle, which is what makes at-least-once delivery safe.
 func TestConsumerAcknowledgesRedeliveryWithoutCreatingAnotherLifecycle(t *testing.T) {
 	t.Parallel()
-	repository := memory.New()
-	t.Cleanup(func() { _ = repository.Close() })
+
+	sessionID := sessiontest.SessionID(901)
+	repo := memory.New()
+	t.Cleanup(func() { _ = repo.Close() })
 	application, err := service.New(service.Dependencies{
-		Repository: repository,
-		NewSessionID: func() (string, error) {
-			return "00000000-0000-4000-8000-000000000901", nil
-		},
+		Repository:   repo,
+		NewSessionID: func() (string, error) { return sessionID, nil },
 	})
 	if err != nil {
 		t.Fatalf("service.New() error = %v", err)
 	}
 
-	first := &messageStub{data: validEventJSON()}
-	redelivery := &messageStub{data: validEventJSON()}
-	consumer := mustConsumer(t, &sourceStub{messages: []Message{first, redelivery}}, application, nil, Options{})
+	steps := &journal{}
+	first := newMessage(steps, validEventJSON())
+	redelivery := newMessage(steps, validEventJSON())
+	consumer := newConsumer(t, &sourceStub{messages: []Message{first, redelivery}}, application, nil, Options{})
 	if err := consumer.Run(context.Background()); err != nil {
 		t.Fatalf("Run() error = %v", err)
 	}
-	if first.acks != 1 || redelivery.acks != 1 {
-		t.Fatalf("acknowledgements = first %d, redelivery %d; want 1 each", first.acks, redelivery.acks)
-	}
 
-	result, err := repository.Query(context.Background(), session.QuerySpec{
-		Filters:     []session.Filter{{Field: "sessionId", Operator: "eq", Value: "00000000-0000-4000-8000-000000000901"}},
-		EvaluatedAt: time.Date(2026, 8, 21, 10, 1, 0, 0, time.UTC),
-	})
-	if err != nil {
-		t.Fatalf("repository.Query() error = %v", err)
+	if want := []string{"ack", "ack"}; !reflect.DeepEqual(steps.steps, want) {
+		t.Fatalf("operations = %v, want both messages acknowledged", steps.steps)
 	}
-	if len(result.Sessions) != 1 || len(result.Sessions[0].States) != 1 {
-		t.Fatalf("stored sessions = %+v, want one lifecycle with one state", result.Sessions)
+	result := sessiontest.Query(t, repo, sessiontest.Spec(sessiontest.At("10:01"),
+		sessiontest.Filter("sessionId", "eq", sessionID),
+	))
+	if len(result.Sessions) != 1 {
+		t.Fatalf("stored sessions = %+v, want exactly one lifecycle", result.Sessions)
+	}
+	if len(result.Sessions[0].States) != 1 {
+		t.Fatalf("stored states = %+v, want the redelivery to add none", result.Sessions[0].States)
 	}
 }
 
+// A transient failure is retried later rather than dropped.
 func TestConsumerDelaysTransientFailure(t *testing.T) {
 	t.Parallel()
+
 	retryDelay := 7 * time.Second
-	message := &messageStub{data: validEventJSON()}
-	source := &sourceStub{messages: []Message{message}}
-	applier := applierFunc(func(context.Context, service.Event) error { return errors.New("database unavailable") })
-	consumer := mustConsumer(t, source, applier, nil, Options{RetryDelay: retryDelay})
+	steps := &journal{}
+	message := newMessage(steps, validEventJSON())
+	applier := appliesWith(steps, errors.New("database unavailable"))
+	consumer := newConsumer(t, &sourceStub{messages: []Message{message}}, applier, nil, Options{RetryDelay: retryDelay})
 
 	if err := consumer.Run(context.Background()); err != nil {
 		t.Fatalf("Run() error = %v", err)
 	}
-	if message.naks != 1 || message.nakDelay != retryDelay || message.acks != 0 || message.terms != 0 {
-		t.Fatalf("message dispositions = ack %d nak %d delay %v term %d", message.acks, message.naks, message.nakDelay, message.terms)
+	if want := []string{"apply", "nak"}; !reflect.DeepEqual(steps.steps, want) {
+		t.Fatalf("operations = %v, want %v", steps.steps, want)
+	}
+	if message.nakDelay != retryDelay {
+		t.Errorf("retry delay = %v, want %v", message.nakDelay, retryDelay)
 	}
 }
 
-func TestConsumerDeadLettersPermanentAndMalformedEventsBeforeTermination(t *testing.T) {
+// An event that can never succeed is dead-lettered first and terminated only
+// after the dead letter is safely stored.
+func TestConsumerDeadLettersBeforeTerminating(t *testing.T) {
 	t.Parallel()
+
 	tests := []struct {
 		name       string
 		data       []byte
 		applyError error
 	}{
 		{name: "permanent domain error", data: validEventJSON(), applyError: session.ErrInvalidTransition},
-		{name: "malformed envelope", data: []byte(`{"eventId":`), applyError: nil},
+		{name: "malformed envelope", data: []byte(`{"eventId":`)},
 	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()
-			order := []string{}
-			message := &messageStub{data: tt.data, term: func() error {
-				order = append(order, "term")
+			steps := &journal{}
+			message := newMessage(steps, test.data)
+			var got DeadLetter
+			publisher := deadLetterFunc(func(_ context.Context, letter DeadLetter) error {
+				steps.add("dlq")
+				got = letter
 				return nil
-			}}
-			source := &sourceStub{messages: []Message{message}}
-			publisher := &deadLetterStub{publish: func(_ context.Context, letter DeadLetter) error {
-				order = append(order, "dlq")
-				if !reflect.DeepEqual(letter.Payload, tt.data) || letter.Reason == "" {
-					t.Fatalf("dead letter = %+v", letter)
-				}
-				return nil
-			}}
-			applier := applierFunc(func(context.Context, service.Event) error { return tt.applyError })
-			consumer := mustConsumer(t, source, applier, publisher, Options{})
+			})
+			applier := applierFunc(func(context.Context, service.Event) error { return test.applyError })
+			consumer := newConsumer(t, &sourceStub{messages: []Message{message}}, applier, publisher, Options{})
 
 			if err := consumer.Run(context.Background()); err != nil {
 				t.Fatalf("Run() error = %v", err)
 			}
-			if !reflect.DeepEqual(order, []string{"dlq", "term"}) {
-				t.Fatalf("operation order = %v, want dlq then term", order)
+			if want := []string{"dlq", "term"}; !reflect.DeepEqual(steps.steps, want) {
+				t.Fatalf("operations = %v, want %v", steps.steps, want)
 			}
-			if message.terms != 1 || message.acks != 0 || message.naks != 0 {
-				t.Fatalf("message dispositions = ack %d nak %d term %d", message.acks, message.naks, message.terms)
+			if !reflect.DeepEqual(got.Payload, test.data) {
+				t.Errorf("dead letter payload = %q, want the original message %q", got.Payload, test.data)
+			}
+			if got.Reason == "" {
+				t.Error("the dead letter carries no reason")
 			}
 		})
 	}
 }
 
+// If the dead letter cannot be published, the original message is retried
+// instead of being terminated and lost.
 func TestConsumerRetriesWhenDeadLetterPublishFails(t *testing.T) {
 	t.Parallel()
-	publishError := errors.New("DLQ unavailable")
-	message := &messageStub{data: []byte(`not-json`)}
-	source := &sourceStub{messages: []Message{message}}
-	publisher := &deadLetterStub{publish: func(context.Context, DeadLetter) error { return publishError }}
-	consumer := mustConsumer(t, source, applierFunc(func(context.Context, service.Event) error { return nil }), publisher, Options{RetryDelay: time.Second})
+
+	steps := &journal{}
+	message := newMessage(steps, []byte(`not-json`))
+	publisher := deadLetterFunc(func(context.Context, DeadLetter) error { return errors.New("DLQ unavailable") })
+	applier := applierFunc(func(context.Context, service.Event) error { return nil })
+	consumer := newConsumer(t, &sourceStub{messages: []Message{message}}, applier, publisher, Options{RetryDelay: time.Second})
 
 	if err := consumer.Run(context.Background()); err != nil {
 		t.Fatalf("Run() error = %v", err)
 	}
-	if message.naks != 1 || message.terms != 0 || message.acks != 0 {
-		t.Fatalf("message dispositions = ack %d nak %d term %d", message.acks, message.naks, message.terms)
+	if want := []string{"nak"}; !reflect.DeepEqual(steps.steps, want) {
+		t.Fatalf("operations = %v, want %v", steps.steps, want)
 	}
 }
 
+// Shutting down mid-message leaves it undisposed, so the broker redelivers it.
 func TestConsumerCancellationLeavesInFlightMessageUnacknowledged(t *testing.T) {
 	t.Parallel()
+
 	ctx, cancel := context.WithCancel(context.Background())
-	message := &messageStub{data: validEventJSON()}
-	source := &sourceStub{messages: []Message{message}}
+	steps := &journal{}
+	message := newMessage(steps, validEventJSON())
 	applier := applierFunc(func(context.Context, service.Event) error {
 		cancel()
 		return context.Canceled
 	})
-	consumer := mustConsumer(t, source, applier, nil, Options{})
+	consumer := newConsumer(t, &sourceStub{messages: []Message{message}}, applier, nil, Options{})
 
 	if err := consumer.Run(ctx); !errors.Is(err, context.Canceled) {
-		t.Fatalf("Run() error = %v, want context cancellation", err)
+		t.Fatalf("Run() error = %v, want context.Canceled", err)
 	}
-	if message.acks != 0 || message.naks != 0 || message.terms != 0 {
-		t.Fatalf("cancelled message was disposed: ack %d nak %d term %d", message.acks, message.naks, message.terms)
+	if len(steps.steps) != 0 {
+		t.Fatalf("operations = %v, want the message left undisposed", steps.steps)
 	}
 }
+
+// journal records the operations a test observes, in order.
+type journal struct{ steps []string }
+
+func (j *journal) add(step string) { j.steps = append(j.steps, step) }
 
 type sourceStub struct {
 	messages []Message
@@ -202,39 +218,29 @@ func (*sourceStub) Close() error { return nil }
 
 type messageStub struct {
 	data     []byte
-	ack      func(context.Context) error
-	nak      func(time.Duration) error
-	term     func() error
-	acks     int
-	naks     int
-	terms    int
+	journal  *journal
 	nakDelay time.Duration
+}
+
+func newMessage(steps *journal, data []byte) *messageStub {
+	return &messageStub{data: data, journal: steps}
 }
 
 func (m *messageStub) Data() []byte { return m.data }
 
-func (m *messageStub) Ack(ctx context.Context) error {
-	m.acks++
-	if m.ack != nil {
-		return m.ack(ctx)
-	}
+func (m *messageStub) Ack(context.Context) error {
+	m.journal.add("ack")
 	return nil
 }
 
 func (m *messageStub) NakWithDelay(delay time.Duration) error {
-	m.naks++
 	m.nakDelay = delay
-	if m.nak != nil {
-		return m.nak(delay)
-	}
+	m.journal.add("nak")
 	return nil
 }
 
 func (m *messageStub) Term() error {
-	m.terms++
-	if m.term != nil {
-		return m.term()
-	}
+	m.journal.add("term")
 	return nil
 }
 
@@ -244,15 +250,21 @@ func (fn applierFunc) ApplyEvent(ctx context.Context, event service.Event) error
 	return fn(ctx, event)
 }
 
-type deadLetterStub struct {
-	publish func(context.Context, DeadLetter) error
+// appliesWith records the application step and then reports result.
+func appliesWith(steps *journal, result error) applierFunc {
+	return func(context.Context, service.Event) error {
+		steps.add("apply")
+		return result
+	}
 }
 
-func (p *deadLetterStub) PublishDeadLetter(ctx context.Context, letter DeadLetter) error {
-	return p.publish(ctx, letter)
+type deadLetterFunc func(context.Context, DeadLetter) error
+
+func (fn deadLetterFunc) PublishDeadLetter(ctx context.Context, letter DeadLetter) error {
+	return fn(ctx, letter)
 }
 
-func mustConsumer(t *testing.T, source Source, applier EventApplier, publisher DeadLetterPublisher, options Options) *Consumer {
+func newConsumer(t *testing.T, source Source, applier EventApplier, publisher DeadLetterPublisher, options Options) *Consumer {
 	t.Helper()
 	consumer, err := NewConsumer(source, applier, publisher, options)
 	if err != nil {
@@ -261,6 +273,12 @@ func mustConsumer(t *testing.T, source Source, applier EventApplier, publisher D
 	return consumer
 }
 
+// streamEventID is the event ID inside validEventJSON.
+var streamEventID = sessiontest.EventID(901)
+
+// validEventJSON is the canonical login envelope the stream tests replay.
 func validEventJSON() []byte {
-	return []byte(`{"eventId":"90000000-0000-4000-8000-000000000001","type":"LOGIN","tenantId":"tenant-a","username":"alice","ip":"192.0.2.10","tags":["user"],"timestamp":"2026-08-21T10:00:00Z"}`)
+	return fmt.Appendf(nil,
+		`{"eventId":%q,"type":"LOGIN","tenantId":"tenant-a","username":"alice","ip":"192.0.2.10","tags":["user"],"timestamp":%q}`,
+		streamEventID, sessiontest.At("10:00").Format(time.RFC3339))
 }

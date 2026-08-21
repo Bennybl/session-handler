@@ -4,204 +4,167 @@ import (
 	"context"
 	"errors"
 	"testing"
-	"time"
 
 	"github.com/Bennybl/session-handler/internal/query"
 	"github.com/Bennybl/session-handler/internal/repository"
-	"github.com/Bennybl/session-handler/internal/repository/repositorytest"
 	"github.com/Bennybl/session-handler/internal/session"
+	"github.com/Bennybl/session-handler/internal/sessiontest"
 )
 
-const secondSessionID = "00000000-0000-0000-0000-000000000102"
+var secondSessionID = sessiontest.SessionID(102)
 
 func TestQueryContract(t *testing.T) {
-	queryCases := map[string]bool{
-		"generic state scoped filters":  true,
-		"pagination and stable cursors": true,
-		"query result isolation":        true,
-	}
-	for _, contractCase := range repositorytest.Cases() {
-		contractCase := contractCase
-		if !queryCases[contractCase.Name] {
-			continue
-		}
-		t.Run(contractCase.Name, func(t *testing.T) {
-			contractCase.Run(t, func(t *testing.T) repository.SessionRepository {
-				return newRepository(t, true)
-			})
-		})
-	}
+	runContractCases(t, "generic state scoped filters", "pagination and stable cursors", "query result isolation")
 }
 
 func TestQuerySupportsEveryRegistryEntry(t *testing.T) {
-	repo := newRepository(t, true)
-	ctx := context.Background()
-	key := mustKey(t, "tenant-a", "alice", "192.0.2.10")
-	loginAt := mustTime(t, "2026-08-21T10:00:00Z")
-	evaluatedAt := loginAt.Add(30 * time.Minute)
-	seedLogin(t, repo, key, firstSessionID, loginAt)
+	repo := freshRepository(t)
+	key := sessiontest.Key("tenant-a", "alice", "192.0.2.10")
+	loginAt := sessiontest.At("10:00")
+	evaluatedAt := sessiontest.At("10:30")
+	sessiontest.Login(t, repo, key, firstSessionID, loginAt, "user")
 
+	// Every filter below describes the one seeded session, so each registry
+	// entry is exercised against real SQL.
 	tests := []struct {
 		name   string
 		filter session.Filter
-		wantID string
 	}{
-		{name: "session id equals", filter: session.Filter{Field: "sessionId", Operator: "eq", Value: firstSessionID}, wantID: firstSessionID},
-		{name: "session id in", filter: session.Filter{Field: "sessionId", Operator: "in", Value: []string{secondSessionID, firstSessionID}}, wantID: firstSessionID},
-		{name: "tenant equals", filter: session.Filter{Field: "tenantId", Operator: "eq", Value: "tenant-a"}, wantID: firstSessionID},
-		{name: "tenant in", filter: session.Filter{Field: "tenantId", Operator: "in", Value: []string{"tenant-b", "tenant-a"}}, wantID: firstSessionID},
-		{name: "username equals", filter: session.Filter{Field: "username", Operator: "eq", Value: "alice"}, wantID: firstSessionID},
-		{name: "username in", filter: session.Filter{Field: "username", Operator: "in", Value: []string{"bob", "alice"}}, wantID: firstSessionID},
-		{name: "ip equals", filter: session.Filter{Field: "ip", Operator: "eq", Value: "192.0.2.10"}, wantID: firstSessionID},
-		{name: "ip in", filter: session.Filter{Field: "ip", Operator: "in", Value: []string{"192.0.2.11", "192.0.2.10"}}, wantID: firstSessionID},
-		{name: "tags contain all", filter: session.Filter{Field: "tags", Operator: "containsAll", Value: []string{"user"}}, wantID: firstSessionID},
-		{name: "tags contain any", filter: session.Filter{Field: "tags", Operator: "containsAny", Value: []string{"missing", "user"}}, wantID: firstSessionID},
-		{name: "activity at", filter: session.Filter{Field: "activity", Operator: "at", Value: evaluatedAt}, wantID: firstSessionID},
-		{name: "activity overlaps", filter: session.Filter{Field: "activity", Operator: "overlaps", Value: query.IntervalValue{From: timePointer(loginAt.Add(time.Minute)), To: timePointer(evaluatedAt)}}, wantID: firstSessionID},
-		{name: "login equals", filter: session.Filter{Field: "loginTime", Operator: "eq", Value: loginAt}, wantID: firstSessionID},
-		{name: "login greater", filter: session.Filter{Field: "loginTime", Operator: "gt", Value: loginAt.Add(-time.Minute)}, wantID: firstSessionID},
-		{name: "login greater or equal", filter: session.Filter{Field: "loginTime", Operator: "gte", Value: loginAt}, wantID: firstSessionID},
-		{name: "login less", filter: session.Filter{Field: "loginTime", Operator: "lt", Value: loginAt.Add(time.Minute)}, wantID: firstSessionID},
-		{name: "login less or equal", filter: session.Filter{Field: "loginTime", Operator: "lte", Value: loginAt}, wantID: firstSessionID},
-		{name: "login between", filter: session.Filter{Field: "loginTime", Operator: "between", Value: query.IntervalValue{From: timePointer(loginAt.Add(-time.Minute)), To: timePointer(loginAt.Add(time.Minute))}}, wantID: firstSessionID},
+		{name: "session ID equals", filter: sessiontest.Filter("sessionId", "eq", firstSessionID)},
+		{name: "session ID in", filter: sessiontest.Filter("sessionId", "in", []string{secondSessionID, firstSessionID})},
+		{name: "tenant equals", filter: sessiontest.Filter("tenantId", "eq", "tenant-a")},
+		{name: "tenant in", filter: sessiontest.Filter("tenantId", "in", []string{"tenant-b", "tenant-a"})},
+		{name: "username equals", filter: sessiontest.Filter("username", "eq", "alice")},
+		{name: "username in", filter: sessiontest.Filter("username", "in", []string{"bob", "alice"})},
+		{name: "IP equals", filter: sessiontest.Filter("ip", "eq", "192.0.2.10")},
+		{name: "IP in", filter: sessiontest.Filter("ip", "in", []string{"192.0.2.11", "192.0.2.10"})},
+		{name: "tags contain all", filter: sessiontest.Filter("tags", "containsAll", []string{"user"})},
+		{name: "tags contain any", filter: sessiontest.Filter("tags", "containsAny", []string{"missing", "user"})},
+		{name: "activity at", filter: sessiontest.Filter("activity", "at", evaluatedAt)},
+		{name: "activity overlaps", filter: sessiontest.Filter("activity", "overlaps", interval("10:01", "10:30"))},
+		{name: "login time equals", filter: sessiontest.Filter("loginTime", "eq", loginAt)},
+		{name: "login time greater than", filter: sessiontest.Filter("loginTime", "gt", sessiontest.At("09:59"))},
+		{name: "login time greater or equal", filter: sessiontest.Filter("loginTime", "gte", loginAt)},
+		{name: "login time less than", filter: sessiontest.Filter("loginTime", "lt", sessiontest.At("10:01"))},
+		{name: "login time less or equal", filter: sessiontest.Filter("loginTime", "lte", loginAt)},
+		{name: "login time between", filter: sessiontest.Filter("loginTime", "between", interval("09:59", "10:01"))},
 	}
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			result, err := repo.Query(ctx, session.QuerySpec{
-				Filters: []session.Filter{tt.filter}, Page: session.PageRequest{Limit: 10}, EvaluatedAt: evaluatedAt,
-			})
-			if err != nil {
-				t.Fatalf("Query() error = %v", err)
-			}
-			if len(result.Sessions) != 1 || result.Sessions[0].ID != tt.wantID {
-				t.Fatalf("Query() sessions = %+v, want %s", result.Sessions, tt.wantID)
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			result := sessiontest.Query(t, repo, sessiontest.Spec(evaluatedAt, test.filter))
+			if len(result.Sessions) != 1 || result.Sessions[0].ID != firstSessionID {
+				t.Fatalf("matching sessions = %+v, want only %q", result.Sessions, firstSessionID)
 			}
 		})
 	}
 }
 
+// Activity and tag filters compile into one correlated predicate, so they must
+// be satisfied by the same state row.
 func TestQueryUsesOneMatchingStateAndLoadsCompleteHistory(t *testing.T) {
-	repo := newRepository(t, true)
-	ctx := context.Background()
-	key := mustKey(t, "tenant-a", "alice", "192.0.2.10")
-	loginAt := mustTime(t, "2026-08-21T10:00:00Z")
-	updateAt := loginAt.Add(time.Hour)
-	seedLogin(t, repo, key, firstSessionID, loginAt)
-	if err := repo.Mutate(ctx, key, func(snapshot session.CurrentSessionSnapshot) (session.Mutation, error) {
-		return session.DecideUpdate(snapshot, session.UpdateCommand{EventID: postgresUpdateEventID, Key: key, Tags: []string{"admin"}, Timestamp: updateAt})
-	}); err != nil {
-		t.Fatalf("seed update: %v", err)
+	repo := freshRepository(t)
+	key := sessiontest.Key("tenant-a", "alice", "192.0.2.10")
+	loginAt, updateAt := sessiontest.At("10:00"), sessiontest.At("11:00")
+	evaluatedAt := sessiontest.At("11:01")
+	sessiontest.Login(t, repo, key, firstSessionID, loginAt, "user")
+	sessiontest.Update(t, repo, key, updateAt, "admin")
+
+	// At 10:30 the session was tagged "user", not "admin".
+	mismatched := sessiontest.Query(t, repo, sessiontest.Spec(evaluatedAt,
+		sessiontest.Filter("activity", "at", sessiontest.At("10:30")),
+		sessiontest.Filter("tags", "containsAll", []string{"admin"}),
+	))
+	if len(mismatched.Sessions) != 0 {
+		t.Fatalf("matching sessions = %+v, want none; the filters matched different states", mismatched.Sessions)
 	}
 
-	result, err := repo.Query(ctx, session.QuerySpec{
-		Filters: []session.Filter{
-			{Field: "activity", Operator: "at", Value: loginAt.Add(30 * time.Minute)},
-			{Field: "tags", Operator: "containsAll", Value: []string{"admin"}},
-		},
-		Page: session.PageRequest{Limit: 10}, EvaluatedAt: updateAt.Add(time.Minute),
-	})
-	if err != nil {
-		t.Fatalf("mismatched-state Query() error = %v", err)
+	// After 11:00 both filters describe the same state, and the response then
+	// carries the session's complete history.
+	matched := sessiontest.Query(t, repo, sessiontest.Spec(evaluatedAt,
+		sessiontest.Filter("activity", "at", evaluatedAt),
+		sessiontest.Filter("tags", "containsAll", []string{"admin"}),
+	))
+	if len(matched.Sessions) != 1 {
+		t.Fatalf("matching sessions = %+v, want one", matched.Sessions)
 	}
-	if len(result.Sessions) != 0 {
-		t.Fatalf("mismatched-state sessions = %+v, want none", result.Sessions)
-	}
-
-	result, err = repo.Query(ctx, session.QuerySpec{
-		Filters: []session.Filter{
-			{Field: "activity", Operator: "at", Value: updateAt.Add(time.Minute)},
-			{Field: "tags", Operator: "containsAll", Value: []string{"admin"}},
-		},
-		Page: session.PageRequest{Limit: 10}, EvaluatedAt: updateAt.Add(time.Minute),
-	})
-	if err != nil {
-		t.Fatalf("matching-state Query() error = %v", err)
-	}
-	if len(result.Sessions) != 1 || len(result.Sessions[0].States) != 2 {
-		t.Fatalf("matching-state sessions = %+v, want one complete two-state history", result.Sessions)
+	if len(matched.Sessions[0].States) != 2 {
+		t.Fatalf("states = %+v, want the complete two-state history", matched.Sessions[0].States)
 	}
 }
 
+// Paging counts sessions, not the state rows they join to, so a session with
+// several matching states still occupies one slot on a page.
 func TestQueryPagesDistinctSessionsAcrossKeysetBoundaries(t *testing.T) {
-	repo := newRepository(t, true)
-	ctx := context.Background()
-	loginAt := mustTime(t, "2026-08-21T10:00:00Z")
-	updateAt := loginAt.Add(time.Hour)
-	alice := mustKey(t, "tenant-a", "alice", "192.0.2.10")
-	bob := mustKey(t, "tenant-a", "bob", "192.0.2.10")
-	seedLogin(t, repo, alice, firstSessionID, loginAt)
-	if err := repo.Mutate(ctx, alice, func(snapshot session.CurrentSessionSnapshot) (session.Mutation, error) {
-		return session.DecideUpdate(snapshot, session.UpdateCommand{EventID: postgresUpdateEventID, Key: alice, Tags: []string{"user"}, Timestamp: updateAt})
-	}); err != nil {
-		t.Fatalf("seed Alice update: %v", err)
-	}
-	seedLogin(t, repo, bob, secondSessionID, loginAt)
+	repo := freshRepository(t)
+	loginAt, updateAt := sessiontest.At("10:00"), sessiontest.At("11:00")
+	alice := sessiontest.Key("tenant-a", "alice", "192.0.2.10")
+	sessiontest.Login(t, repo, alice, firstSessionID, loginAt, "user")
+	sessiontest.Update(t, repo, alice, updateAt, "user")
+	sessiontest.Login(t, repo, sessiontest.Key("tenant-a", "bob", "192.0.2.10"), secondSessionID, loginAt, "user")
 
 	spec := session.QuerySpec{
-		Filters: []session.Filter{{
-			Field: "activity", Operator: "overlaps",
-			Value: query.IntervalValue{From: timePointer(loginAt), To: timePointer(updateAt.Add(time.Hour))},
-		}},
-		Page: session.PageRequest{Limit: 1}, EvaluatedAt: updateAt,
+		Filters:     []session.Filter{sessiontest.Filter("activity", "overlaps", interval("10:00", "12:00"))},
+		Page:        session.PageRequest{Limit: 1},
+		EvaluatedAt: updateAt,
 	}
-	first, err := repo.Query(ctx, spec)
-	if err != nil {
-		t.Fatalf("first Query() error = %v", err)
+	first := sessiontest.Query(t, repo, spec)
+	if len(first.Sessions) != 1 || first.Sessions[0].ID != firstSessionID || first.NextCursor == "" {
+		t.Fatalf("first page = %+v, want only %q and a cursor", first, firstSessionID)
 	}
-	if len(first.Sessions) != 1 || first.Sessions[0].ID != firstSessionID || len(first.Sessions[0].States) != 2 || first.NextCursor == "" {
-		t.Fatalf("first page = %+v", first)
+	if len(first.Sessions[0].States) != 2 {
+		t.Fatalf("first page states = %+v, want both of Alice's states", first.Sessions[0].States)
 	}
 
 	spec.Page.Cursor = first.NextCursor
-	second, err := repo.Query(ctx, spec)
-	if err != nil {
-		t.Fatalf("second Query() error = %v", err)
-	}
+	second := sessiontest.Query(t, repo, spec)
 	if len(second.Sessions) != 1 || second.Sessions[0].ID != secondSessionID || second.NextCursor != "" {
-		t.Fatalf("second page = %+v", second)
+		t.Fatalf("second page = %+v, want only %q and no cursor", second, secondSessionID)
 	}
 }
 
+// Field names, operators, and values never reach the SQL text: unknown names
+// are rejected and values are always bound as parameters.
 func TestQueryRejectsUnsupportedAndInjectionShapedInputs(t *testing.T) {
-	repo := newRepository(t, true)
+	repo := freshRepository(t)
 	ctx := context.Background()
-	key := mustKey(t, "tenant-a", "alice", "192.0.2.10")
-	at := mustTime(t, "2026-08-21T10:00:00Z")
-	seedLogin(t, repo, key, firstSessionID, at)
+	at := sessiontest.At("10:00")
+	evaluatedAt := sessiontest.At("10:01")
+	sessiontest.Login(t, repo, sessiontest.Key("tenant-a", "alice", "192.0.2.10"), firstSessionID, at, "user")
 
-	invalid := []session.Filter{
-		{Field: "tenant_id) = 'tenant-a' OR TRUE --", Operator: "eq", Value: "tenant-a"},
-		{Field: "tenantId", Operator: "eq OR TRUE --", Value: "tenant-a"},
-		{Field: "sessionId", Operator: "eq", Value: "' OR TRUE --"},
+	rejected := []struct {
+		name   string
+		filter session.Filter
+	}{
+		{name: "injected field", filter: sessiontest.Filter("tenant_id) = 'tenant-a' OR TRUE --", "eq", "tenant-a")},
+		{name: "injected operator", filter: sessiontest.Filter("tenantId", "eq OR TRUE --", "tenant-a")},
+		{name: "injected value for a UUID field", filter: sessiontest.Filter("sessionId", "eq", "' OR TRUE --")},
 	}
-	for _, filter := range invalid {
-		_, err := repo.Query(ctx, session.QuerySpec{Filters: []session.Filter{filter}, EvaluatedAt: at.Add(time.Minute)})
-		if !errors.Is(err, repository.ErrInvalidQuery) {
-			t.Fatalf("Query(%+v) error = %v, want ErrInvalidQuery", filter, err)
-		}
-	}
-
-	result, err := repo.Query(ctx, session.QuerySpec{
-		Filters:     []session.Filter{{Field: "tenantId", Operator: "eq", Value: "tenant-a' OR TRUE --"}},
-		EvaluatedAt: at.Add(time.Minute),
-	})
-	if err != nil {
-		t.Fatalf("parameter-shaped Query() error = %v", err)
-	}
-	if len(result.Sessions) != 0 {
-		t.Fatalf("parameter-shaped Query() sessions = %+v, want none", result.Sessions)
+	for _, test := range rejected {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := repo.Query(ctx, sessiontest.Spec(evaluatedAt, test.filter))
+			if !errors.Is(err, repository.ErrInvalidQuery) {
+				t.Fatalf("Query() error = %v, want ErrInvalidQuery", err)
+			}
+		})
 	}
 
-	result, err = repo.Query(ctx, session.QuerySpec{
-		Filters:     []session.Filter{{Field: "tenantId", Operator: "eq", Value: "tenant-a"}},
-		EvaluatedAt: at.Add(time.Minute),
-	})
-	if err != nil || len(result.Sessions) != 1 {
-		t.Fatalf("post-injection Query() result = %+v, error = %v", result, err)
+	// An injection-shaped value on a string field is a value, so it matches
+	// nothing and leaves the store intact.
+	injected := sessiontest.Query(t, repo, sessiontest.Spec(evaluatedAt,
+		sessiontest.Filter("tenantId", "eq", "tenant-a' OR TRUE --"),
+	))
+	if len(injected.Sessions) != 0 {
+		t.Fatalf("matching sessions = %+v, want none", injected.Sessions)
+	}
+	surviving := sessiontest.Query(t, repo, sessiontest.Spec(evaluatedAt,
+		sessiontest.Filter("tenantId", "eq", "tenant-a"),
+	))
+	if len(surviving.Sessions) != 1 {
+		t.Fatalf("matching sessions after the injection attempts = %+v, want the seeded session", surviving.Sessions)
 	}
 }
 
-func timePointer(value time.Time) *time.Time {
-	return &value
+func interval(from, to string) query.IntervalValue {
+	return query.IntervalValue{From: sessiontest.Ptr(sessiontest.At(from)), To: sessiontest.Ptr(sessiontest.At(to))}
 }

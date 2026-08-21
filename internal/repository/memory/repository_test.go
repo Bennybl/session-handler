@@ -15,72 +15,59 @@ import (
 	"github.com/Bennybl/session-handler/internal/repository/memory"
 	"github.com/Bennybl/session-handler/internal/repository/repositorytest"
 	"github.com/Bennybl/session-handler/internal/session"
+	"github.com/Bennybl/session-handler/internal/sessiontest"
 )
 
-const (
-	aliceID       = "00000000-0000-0000-0000-000000000001"
-	bobID         = "00000000-0000-0000-0000-000000000002"
-	charlieID     = "00000000-0000-0000-0000-000000000003"
-	loginEventID  = "20000000-0000-4000-8000-000000000001"
-	updateEventID = "20000000-0000-4000-8000-000000000002"
-	logoutEventID = "20000000-0000-4000-8000-000000000003"
+// The sessions newFilterFixture seeds.
+var (
+	aliceID   = sessiontest.SessionID(1)
+	bobID     = sessiontest.SessionID(2)
+	charlieID = sessiontest.SessionID(3)
 )
 
 func TestRepositoryContract(t *testing.T) {
-	repositorytest.Run(t, func(t *testing.T) repository.SessionRepository {
-		return memory.New()
-	})
+	repositorytest.Run(t, newRepository)
 }
 
 func TestEventIDContract(t *testing.T) {
-	repositorytest.EventIDCase().Run(t, func(t *testing.T) repository.SessionRepository {
-		return memory.New()
-	})
+	repositorytest.EventIDCase().Run(t, newRepository)
 }
 
 func TestEveryRegisteredFilterAndOperator(t *testing.T) {
 	t.Parallel()
 
-	repo, fixture := newFilterFixture(t)
+	repo := newFilterFixture(t)
 	tests := []struct {
 		name    string
 		filter  session.Filter
 		wantIDs []string
 	}{
-		{name: "session ID equals", filter: filter("sessionId", "eq", aliceID), wantIDs: []string{aliceID}},
-		{name: "session ID in", filter: filter("sessionId", "in", []string{aliceID, charlieID}), wantIDs: []string{aliceID, charlieID}},
-		{name: "tenant equals", filter: filter("tenantId", "eq", "tenant-a"), wantIDs: []string{aliceID, bobID}},
-		{name: "tenant in", filter: filter("tenantId", "in", []string{"tenant-b"}), wantIDs: []string{charlieID}},
-		{name: "username equals", filter: filter("username", "eq", "alice"), wantIDs: []string{aliceID, charlieID}},
-		{name: "username in", filter: filter("username", "in", []string{"bob"}), wantIDs: []string{bobID}},
-		{name: "IP equals", filter: filter("ip", "eq", "192.0.2.10"), wantIDs: []string{aliceID, bobID}},
-		{name: "IP in", filter: filter("ip", "in", []string{"192.0.2.20"}), wantIDs: []string{charlieID}},
-		{name: "tags contain all", filter: filter("tags", "containsAll", []string{"admin", "user"}), wantIDs: []string{bobID}},
-		{name: "tags contain any", filter: filter("tags", "containsAny", []string{"ops"}), wantIDs: []string{charlieID}},
-		{name: "activity at", filter: filter("activity", "at", fixture.at(10, 10)), wantIDs: []string{aliceID}},
-		{name: "activity overlaps", filter: filter("activity", "overlaps", interval(fixture.at(10, 5), fixture.at(10, 12))), wantIDs: []string{aliceID}},
-		{name: "login time equals", filter: filter("loginTime", "eq", fixture.at(10, 15)), wantIDs: []string{bobID}},
-		{name: "login time greater than", filter: filter("loginTime", "gt", fixture.at(10, 15)), wantIDs: []string{charlieID}},
-		{name: "login time greater than or equal", filter: filter("loginTime", "gte", fixture.at(10, 15)), wantIDs: []string{bobID, charlieID}},
-		{name: "login time less than", filter: filter("loginTime", "lt", fixture.at(10, 15)), wantIDs: []string{aliceID}},
-		{name: "login time less than or equal", filter: filter("loginTime", "lte", fixture.at(10, 15)), wantIDs: []string{aliceID, bobID}},
-		{name: "login time between", filter: filter("loginTime", "between", interval(fixture.at(10, 10), fixture.at(10, 20))), wantIDs: []string{bobID}},
+		{name: "session ID equals", filter: sessiontest.Filter("sessionId", "eq", aliceID), wantIDs: []string{aliceID}},
+		{name: "session ID in", filter: sessiontest.Filter("sessionId", "in", []string{aliceID, charlieID}), wantIDs: []string{aliceID, charlieID}},
+		{name: "tenant equals", filter: sessiontest.Filter("tenantId", "eq", "tenant-a"), wantIDs: []string{aliceID, bobID}},
+		{name: "tenant in", filter: sessiontest.Filter("tenantId", "in", []string{"tenant-b"}), wantIDs: []string{charlieID}},
+		{name: "username equals", filter: sessiontest.Filter("username", "eq", "alice"), wantIDs: []string{aliceID, charlieID}},
+		{name: "username in", filter: sessiontest.Filter("username", "in", []string{"bob"}), wantIDs: []string{bobID}},
+		{name: "IP equals", filter: sessiontest.Filter("ip", "eq", "192.0.2.10"), wantIDs: []string{aliceID, bobID}},
+		{name: "IP in", filter: sessiontest.Filter("ip", "in", []string{"192.0.2.20"}), wantIDs: []string{charlieID}},
+		{name: "tags contain all", filter: sessiontest.Filter("tags", "containsAll", []string{"admin", "user"}), wantIDs: []string{bobID}},
+		{name: "tags contain any", filter: sessiontest.Filter("tags", "containsAny", []string{"ops"}), wantIDs: []string{charlieID}},
+		{name: "activity at", filter: sessiontest.Filter("activity", "at", sessiontest.At("10:10")), wantIDs: []string{aliceID}},
+		{name: "activity overlaps", filter: sessiontest.Filter("activity", "overlaps", interval("10:05", "10:12")), wantIDs: []string{aliceID}},
+		{name: "login time equals", filter: sessiontest.Filter("loginTime", "eq", sessiontest.At("10:15")), wantIDs: []string{bobID}},
+		{name: "login time greater than", filter: sessiontest.Filter("loginTime", "gt", sessiontest.At("10:15")), wantIDs: []string{charlieID}},
+		{name: "login time greater or equal", filter: sessiontest.Filter("loginTime", "gte", sessiontest.At("10:15")), wantIDs: []string{bobID, charlieID}},
+		{name: "login time less than", filter: sessiontest.Filter("loginTime", "lt", sessiontest.At("10:15")), wantIDs: []string{aliceID}},
+		{name: "login time less or equal", filter: sessiontest.Filter("loginTime", "lte", sessiontest.At("10:15")), wantIDs: []string{aliceID, bobID}},
+		{name: "login time between", filter: sessiontest.Filter("loginTime", "between", interval("10:10", "10:20")), wantIDs: []string{bobID}},
 	}
 
 	for _, test := range tests {
-		test := test
 		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()
-			result, err := repo.Query(context.Background(), session.QuerySpec{
-				Filters:     []session.Filter{test.filter},
-				Page:        session.PageRequest{Limit: 50},
-				EvaluatedAt: fixture.at(10, 45),
-			})
-			if err != nil {
-				t.Fatalf("Query() error = %v", err)
-			}
-			if got := resultIDs(result); !reflect.DeepEqual(got, test.wantIDs) {
-				t.Fatalf("Query() IDs = %v, want %v", got, test.wantIDs)
+			result := sessiontest.Query(t, repo, sessiontest.Spec(sessiontest.At("10:45"), test.filter))
+			if got := sortedIDs(result); !reflect.DeepEqual(got, test.wantIDs) {
+				t.Fatalf("matching sessions = %v, want %v", got, test.wantIDs)
 			}
 		})
 	}
@@ -89,115 +76,101 @@ func TestEveryRegisteredFilterAndOperator(t *testing.T) {
 func TestStateFiltersMustMatchTheSameHistoricalState(t *testing.T) {
 	t.Parallel()
 
-	repo, fixture := newFilterFixture(t)
-	result, err := repo.Query(context.Background(), session.QuerySpec{
-		Filters: []session.Filter{
-			filter("sessionId", "eq", aliceID),
-			filter("activity", "at", fixture.at(10, 15)),
-			filter("tags", "containsAll", []string{"admin"}),
-		},
-		Page:        session.PageRequest{Limit: 50},
-		EvaluatedAt: fixture.at(10, 45),
-	})
-	if err != nil {
-		t.Fatalf("Query() error = %v", err)
-	}
+	// Alice carried "user" until 10:30 and "admin" afterwards, so no single
+	// state is both active at 10:15 and tagged admin.
+	repo := newFilterFixture(t)
+	result := sessiontest.Query(t, repo, sessiontest.Spec(sessiontest.At("10:45"),
+		sessiontest.Filter("sessionId", "eq", aliceID),
+		sessiontest.Filter("activity", "at", sessiontest.At("10:15")),
+		sessiontest.Filter("tags", "containsAll", []string{"admin"}),
+	))
+
 	if len(result.Sessions) != 0 {
-		t.Fatalf("Query() returned states from different periods: %+v", result.Sessions)
+		t.Fatalf("matching sessions = %+v, want none; the filters matched different states", result.Sessions)
 	}
 }
 
-func TestCursorPreservesDefaultActivityTime(t *testing.T) {
+func TestQueryCursorPinsTheDefaultActivityTime(t *testing.T) {
 	t.Parallel()
 
-	repo := memory.New()
-	t.Cleanup(func() { _ = repo.Close() })
-	loginAt := mustTime(t, "2026-08-21T10:00:00Z")
-	logoutAt := mustTime(t, "2026-08-21T10:30:00Z")
+	// Both sessions are active at 10:15 but logged out by 10:30, so the second
+	// page is only reachable if the cursor keeps the first page's "now".
+	repo := newRepository(t)
+	loginAt, logoutAt := sessiontest.At("10:00"), sessiontest.At("10:30")
 	for index, username := range []string{"alice", "bob"} {
-		key := mustKey(t, "tenant-a", username, fmt.Sprintf("192.0.2.%d", index+10))
-		id := fmt.Sprintf("00000000-0000-0000-0000-%012d", index+1)
-		applyLogin(t, repo, key, id, loginAt, []string{"user"})
-		applyLogout(t, repo, key, logoutAt)
+		key := sessiontest.Key("tenant-a", username, fmt.Sprintf("192.0.2.%d", index+10))
+		sessiontest.Login(t, repo, key, sessiontest.SessionID(index+1), loginAt, "user")
+		sessiontest.Logout(t, repo, key, logoutAt)
 	}
 
-	first, err := repo.Query(context.Background(), session.QuerySpec{
+	first := sessiontest.Query(t, repo, session.QuerySpec{
 		Page:        session.PageRequest{Limit: 1},
-		EvaluatedAt: loginAt.Add(15 * time.Minute),
+		EvaluatedAt: sessiontest.At("10:15"),
 	})
-	if err != nil {
-		t.Fatalf("first Query() error = %v", err)
-	}
 	if len(first.Sessions) != 1 || first.NextCursor == "" {
-		t.Fatalf("first page = %+v", first)
+		t.Fatalf("first page = %d sessions, cursor %q; want 1 session and a cursor", len(first.Sessions), first.NextCursor)
 	}
 
-	second, err := repo.Query(context.Background(), session.QuerySpec{
+	second := sessiontest.Query(t, repo, session.QuerySpec{
 		Page:        session.PageRequest{Limit: 1, Cursor: first.NextCursor},
-		EvaluatedAt: logoutAt.Add(time.Hour),
+		EvaluatedAt: sessiontest.At("11:30"),
 	})
-	if err != nil {
-		t.Fatalf("second Query() error = %v", err)
-	}
 	if len(second.Sessions) != 1 || second.NextCursor != "" {
-		t.Fatalf("second page = %+v", second)
+		t.Fatalf("second page = %d sessions, cursor %q; want 1 session and no cursor", len(second.Sessions), second.NextCursor)
 	}
 	if first.Sessions[0].ID == second.Sessions[0].ID {
-		t.Fatal("cursor returned the first-page session again")
+		t.Fatalf("both pages returned session %q", first.Sessions[0].ID)
 	}
 }
 
 func TestQueryLoadsCompleteIsolatedHistory(t *testing.T) {
 	t.Parallel()
 
-	repo, fixture := newFilterFixture(t)
-	result, err := repo.Query(context.Background(), session.QuerySpec{
-		Filters: []session.Filter{
-			filter("sessionId", "eq", aliceID),
-			filter("activity", "overlaps", interval(fixture.at(10, 0), fixture.at(11, 0))),
-		},
-		Page:        session.PageRequest{Limit: 50},
-		EvaluatedAt: fixture.at(12, 0),
-	})
-	if err != nil {
-		t.Fatalf("Query() error = %v", err)
-	}
+	repo := newFilterFixture(t)
+	result := sessiontest.Query(t, repo, sessiontest.Spec(sessiontest.At("12:00"),
+		sessiontest.Filter("sessionId", "eq", aliceID),
+		sessiontest.Filter("activity", "overlaps", interval("10:00", "11:00")),
+	))
 	if len(result.Sessions) != 1 {
-		t.Fatalf("Query() sessions = %+v", result.Sessions)
+		t.Fatalf("matching sessions = %+v, want only Alice", result.Sessions)
 	}
+
+	// One matching state selects the session; the response carries all of them.
 	got := result.Sessions[0]
-	if got.LogoutAt == nil || !got.LogoutAt.Equal(fixture.at(11, 0)) || len(got.States) != 2 {
-		t.Fatalf("complete history = %+v", got)
+	if got.LogoutAt == nil || !got.LogoutAt.Equal(sessiontest.At("11:00")) {
+		t.Errorf("LogoutAt = %v, want 11:00", got.LogoutAt)
 	}
-	if got.States[0].ValidTo == nil || !got.States[0].ValidTo.Equal(fixture.at(10, 30)) {
-		t.Fatalf("first historical state = %+v", got.States[0])
+	if len(got.States) != 2 {
+		t.Fatalf("states = %+v, want the complete two-state history", got.States)
+	}
+	if got.States[0].ValidTo == nil || !got.States[0].ValidTo.Equal(sessiontest.At("10:30")) {
+		t.Errorf("first state ended at %v, want 10:30", got.States[0].ValidTo)
 	}
 }
 
 func TestConcurrentMutationAndQueries(t *testing.T) {
-	repo := memory.New()
-	t.Cleanup(func() { _ = repo.Close() })
-	base := mustTime(t, "2026-08-21T10:00:00Z")
+	repo := newRepository(t)
+	at := sessiontest.At("10:00")
 	keys := make([]session.SessionKey, 8)
 	for index := range keys {
-		keys[index] = mustKey(t, "tenant-a", fmt.Sprintf("user-%d", index), fmt.Sprintf("192.0.2.%d", index+1))
-		applyLogin(t, repo, keys[index], fmt.Sprintf("session-%d", index), base, []string{"initial"})
+		keys[index] = sessiontest.Key("tenant-a", fmt.Sprintf("user-%d", index), fmt.Sprintf("192.0.2.%d", index+1))
+		sessiontest.Login(t, repo, keys[index], sessiontest.SessionID(index+1), at, "initial")
 	}
 
 	var wait sync.WaitGroup
-	errorsFound := make(chan error, len(keys)+4)
+	failures := make(chan error, len(keys)+4)
 	for index, key := range keys {
-		index, key := index, key
 		wait.Add(1)
 		go func() {
 			defer wait.Done()
 			err := repo.Mutate(context.Background(), key, func(snapshot session.CurrentSessionSnapshot) (session.Mutation, error) {
 				return session.DecideUpdate(snapshot, session.UpdateCommand{
-					EventID: updateEventID, Key: key, Tags: []string{fmt.Sprintf("updated-%d", index)}, Timestamp: base.Add(time.Minute),
+					EventID: sessiontest.NextEventID(), Key: key,
+					Tags: []string{fmt.Sprintf("updated-%d", index)}, Timestamp: at.Add(time.Minute),
 				})
 			})
 			if err != nil {
-				errorsFound <- err
+				failures <- fmt.Errorf("mutate %s: %w", key.Username, err)
 			}
 		}()
 	}
@@ -206,17 +179,17 @@ func TestConcurrentMutationAndQueries(t *testing.T) {
 		go func() {
 			defer wait.Done()
 			for range 25 {
-				_, err := repo.Query(context.Background(), session.QuerySpec{EvaluatedAt: base.Add(time.Hour)})
-				if err != nil {
-					errorsFound <- err
+				if _, err := repo.Query(context.Background(), session.QuerySpec{EvaluatedAt: at.Add(time.Hour)}); err != nil {
+					failures <- fmt.Errorf("query: %w", err)
 					return
 				}
 			}
 		}()
 	}
+
 	wait.Wait()
-	close(errorsFound)
-	for err := range errorsFound {
+	close(failures)
+	for err := range failures {
 		t.Errorf("concurrent operation error = %v", err)
 	}
 }
@@ -228,100 +201,52 @@ func TestClosedRepositoryRejectsOperations(t *testing.T) {
 	if err := repo.Close(); err != nil {
 		t.Fatalf("Close() error = %v", err)
 	}
-	key := mustKey(t, "tenant-a", "alice", "192.0.2.10")
-	if err := repo.Mutate(context.Background(), key, func(session.CurrentSessionSnapshot) (session.Mutation, error) {
+
+	key := sessiontest.Key("tenant-a", "alice", "192.0.2.10")
+	mutateError := repo.Mutate(context.Background(), key, func(session.CurrentSessionSnapshot) (session.Mutation, error) {
 		return nil, nil
-	}); !errors.Is(err, repository.ErrClosed) {
-		t.Fatalf("Mutate() error = %v, want ErrClosed", err)
+	})
+	if !errors.Is(mutateError, repository.ErrClosed) {
+		t.Errorf("Mutate() error = %v, want ErrClosed", mutateError)
 	}
 	if _, err := repo.Query(context.Background(), session.QuerySpec{EvaluatedAt: time.Now()}); !errors.Is(err, repository.ErrClosed) {
-		t.Fatalf("Query() error = %v, want ErrClosed", err)
+		t.Errorf("Query() error = %v, want ErrClosed", err)
 	}
 }
 
-type filterFixture struct {
-	repo repository.SessionRepository
-	day  time.Time
-}
-
-func newFilterFixture(t *testing.T) (repository.SessionRepository, filterFixture) {
+func newRepository(t *testing.T) repository.SessionRepository {
 	t.Helper()
 	repo := memory.New()
 	t.Cleanup(func() { _ = repo.Close() })
-	fixture := filterFixture{repo: repo, day: mustTime(t, "2026-08-21T00:00:00Z")}
-	alice := mustKey(t, "tenant-a", "alice", "192.0.2.10")
-	bob := mustKey(t, "tenant-a", "bob", "192.0.2.10")
-	charlie := mustKey(t, "tenant-b", "alice", "192.0.2.20")
-	applyLogin(t, repo, alice, aliceID, fixture.at(10, 0), []string{"user"})
-	applyUpdate(t, repo, alice, fixture.at(10, 30), []string{"admin"})
-	applyLogout(t, repo, alice, fixture.at(11, 0))
-	applyLogin(t, repo, bob, bobID, fixture.at(10, 15), []string{"admin", "user"})
-	applyLogin(t, repo, charlie, charlieID, fixture.at(10, 20), []string{"ops"})
-	return repo, fixture
+	return repo
 }
 
-func (f filterFixture) at(hour, minute int) time.Time {
-	return f.day.Add(time.Duration(hour)*time.Hour + time.Duration(minute)*time.Minute)
+// newFilterFixture seeds three sessions that differ in tenant, username, IP,
+// login time, and tags, so one store exercises every registered filter.
+//
+//	alice   tenant-a alice 192.0.2.10  10:00 [user] -> 10:30 [admin] -> out 11:00
+//	bob     tenant-a bob   192.0.2.10  10:15 [admin user]
+//	charlie tenant-b alice 192.0.2.20  10:20 [ops]
+func newFilterFixture(t *testing.T) repository.SessionRepository {
+	t.Helper()
+	repo := newRepository(t)
+	alice := sessiontest.Key("tenant-a", "alice", "192.0.2.10")
+	sessiontest.Login(t, repo, alice, aliceID, sessiontest.At("10:00"), "user")
+	sessiontest.Update(t, repo, alice, sessiontest.At("10:30"), "admin")
+	sessiontest.Logout(t, repo, alice, sessiontest.At("11:00"))
+	sessiontest.Login(t, repo, sessiontest.Key("tenant-a", "bob", "192.0.2.10"), bobID, sessiontest.At("10:15"), "admin", "user")
+	sessiontest.Login(t, repo, sessiontest.Key("tenant-b", "alice", "192.0.2.20"), charlieID, sessiontest.At("10:20"), "ops")
+	return repo
 }
 
-func filter(field, operator string, value any) session.Filter {
-	return session.Filter{Field: session.Field(field), Operator: session.Operator(operator), Value: value}
+func interval(from, to string) query.IntervalValue {
+	return query.IntervalValue{From: sessiontest.Ptr(sessiontest.At(from)), To: sessiontest.Ptr(sessiontest.At(to))}
 }
 
-func interval(from, to time.Time) query.IntervalValue {
-	return query.IntervalValue{From: &from, To: &to}
-}
-
-func resultIDs(result session.QueryResult) []string {
-	ids := make([]string, len(result.Sessions))
-	for index := range result.Sessions {
-		ids[index] = result.Sessions[index].ID
-	}
+// sortedIDs returns the matching session IDs in a stable order, because these
+// tests assert which sessions matched rather than how they were ordered.
+func sortedIDs(result session.QueryResult) []string {
+	ids := sessiontest.SessionIDs(result)
 	sort.Strings(ids)
 	return ids
-}
-
-func applyLogin(t *testing.T, repo repository.SessionRepository, key session.SessionKey, id string, at time.Time, tags []string) {
-	t.Helper()
-	if err := repo.Mutate(context.Background(), key, func(snapshot session.CurrentSessionSnapshot) (session.Mutation, error) {
-		return session.DecideLogin(snapshot, session.LoginCommand{EventID: loginEventID, SessionID: id, Key: key, Tags: tags, Timestamp: at})
-	}); err != nil {
-		t.Fatalf("login error = %v", err)
-	}
-}
-
-func applyUpdate(t *testing.T, repo repository.SessionRepository, key session.SessionKey, at time.Time, tags []string) {
-	t.Helper()
-	if err := repo.Mutate(context.Background(), key, func(snapshot session.CurrentSessionSnapshot) (session.Mutation, error) {
-		return session.DecideUpdate(snapshot, session.UpdateCommand{EventID: updateEventID, Key: key, Tags: tags, Timestamp: at})
-	}); err != nil {
-		t.Fatalf("update error = %v", err)
-	}
-}
-
-func applyLogout(t *testing.T, repo repository.SessionRepository, key session.SessionKey, at time.Time) {
-	t.Helper()
-	if err := repo.Mutate(context.Background(), key, func(snapshot session.CurrentSessionSnapshot) (session.Mutation, error) {
-		return session.DecideLogout(snapshot, session.LogoutCommand{EventID: logoutEventID, Key: key, Timestamp: at})
-	}); err != nil {
-		t.Fatalf("logout error = %v", err)
-	}
-}
-
-func mustKey(t *testing.T, tenantID, username, ip string) session.SessionKey {
-	t.Helper()
-	key, err := session.NewSessionKey(tenantID, username, ip)
-	if err != nil {
-		t.Fatalf("NewSessionKey() error = %v", err)
-	}
-	return key
-}
-
-func mustTime(t *testing.T, value string) time.Time {
-	t.Helper()
-	parsed, err := time.Parse(time.RFC3339Nano, value)
-	if err != nil {
-		t.Fatalf("time.Parse() error = %v", err)
-	}
-	return parsed
 }
