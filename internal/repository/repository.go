@@ -14,7 +14,8 @@ var (
 )
 
 // MutationFunc is a side-effect-free domain transition. A repository may invoke
-// it more than once when its concurrency mechanism requires a retry.
+// it multiple times when its concurrency mechanism retries a transaction, so it
+// must not perform external side effects.
 type MutationFunc func(session.CurrentSessionSnapshot) (session.Mutation, error)
 
 // SessionRepository is the storage-neutral boundary for session lifecycle data.

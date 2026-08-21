@@ -54,3 +54,16 @@ implementing the assignment.
     only `sessions` and `session_states`, and serialize mutations using a
     transaction-scoped advisory lock derived from `(tenantId, username, ip)`
     before locking and reading matching session rows.
+20. After the revised PostgreSQL schema PR was approved and merged, implement
+    only Step 6 with tests first: add pooled PostgreSQL repository connections,
+    per-session-key `pg_advisory_xact_lock`, matching row locks, isolated snapshot
+    loading, transactional typed mutations, rollback, retries, persistence, and
+    context cancellation.
+21. Refine Step 6 review behavior: prefer `ctx.Err()` when cancellation happens
+    during retry handling, explicitly forbid external callback side effects
+    because callbacks may be retried, and include state `valid_to` values when
+    deriving the snapshot's latest event timestamp.
+22. Revise the architecture and implementation steps so events are consumed from
+    a stream rather than an HTTP endpoint. Keep HTTP query-only, provide a
+    zero-dependency stdin stream and durable NATS JetStream adapter, and account
+    for acknowledgement, redelivery, ordering, and atomic event-ID deduplication.

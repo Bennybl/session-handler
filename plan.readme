@@ -1,4 +1,4 @@
-# Dual-Storage Session Handler Architecture
+# Stream-Driven Dual-Storage Session Handler Architecture
 
 ## Summary
 
@@ -6,17 +6,24 @@ Implement interchangeable in-memory and PostgreSQL repositories behind one
 `SessionRepository` interface.
 
 ```text
-                         +-- InMemorySessionRepository
-HTTP -> SessionService -> SessionRepository
-                         +-- PostgresSessionRepository
+stdin stream -----+
+                  +-> EventConsumer -> SessionService --+
+NATS JetStream ---+                                     |
+                                                        +-> SessionRepository
+HTTP query API --------> QueryService ------------------+        |
+                                                                 +-- memory
+                                                                 +-- PostgreSQL
 ```
 
-- `go run ./cmd/server` defaults to memory and requires no Docker or database.
-- `docker compose up --build` runs migrations, PostgreSQL, and the service using
-  PostgreSQL.
+- `go run ./cmd/server` defaults to memory storage and an NDJSON stdin event
+  stream, requiring no Docker or database.
+- `docker compose up --build` runs NATS JetStream, migrations, PostgreSQL, and
+  the service using durable stream ingestion and PostgreSQL storage.
 - Both adapters obey the same mutation and query contracts.
-- Sessions and historical states are stored directly; raw events are commands
-  and are not retained.
+- Events enter only through a stream. HTTP is query-only.
+- Sessions and historical states are stored directly. The repositories do not
+  retain a permanent raw-event log; JetStream retains source messages according
+  to its configured bounded retention policy.
 
 ## Identity and Uniqueness
 
@@ -49,6 +56,7 @@ A `Session` represents one login-to-logout lifecycle:
 - IP address
 - `loginAt`
 - Optional `logoutAt`
+- Last accepted event ID, used internally for stream redelivery deduplication
 - Ordered historical `SessionState` values
 
 ### Session state
@@ -66,6 +74,19 @@ Tags use set semantics: values are deduplicated, stable-sorted, and compared
 case-sensitively. An update supplies the complete replacement set.
 
 ## Event Processing
+
+Every stream message contains:
+
+```text
+SessionEvent
+  eventId       // UUID, required for idempotency
+  type          // LOGIN, UPDATE, or LOGOUT
+  tenantId
+  username
+  ip
+  tags[]        // LOGIN and UPDATE
+  timestamp
+```
 
 Commands produce shared domain mutations:
 
@@ -85,6 +106,38 @@ Rules:
 - Equal-time commands use repository serialization order.
 - Arbitrary late historical correction is unsupported.
 
+## Event Stream Ingestion
+
+Define an `EventSource` boundary so stream transport details stay outside the
+domain and repository layers. Initial adapters are:
+
+- `StdinEventSource`: reads newline-delimited JSON for a zero-dependency local
+  run. EOF stops ingestion but leaves the query server running.
+- `NATSJetStreamEventSource`: consumes subject `sessions.events` through durable
+  consumer `session-handler` with explicit acknowledgements.
+
+The initial JetStream pull consumer fetches one message at a time and uses
+`MaxAckPending=1`. This deliberately favors simple global ordering over
+throughput. A later implementation can partition by canonical `SessionKey` to
+process different keys concurrently without weakening same-key ordering.
+
+Delivery behavior:
+
+1. Decode and validate the stream envelope.
+2. Apply the event through `SessionService` and `SessionRepository.Mutate`.
+3. Atomically store the accepted `eventId` with the session mutation.
+4. Acknowledge only after the repository commits.
+5. Treat a redelivery of the last accepted `eventId` as a successful no-op and
+   acknowledge it.
+6. Use a delayed negative acknowledgement for transient repository failures.
+7. Publish malformed or permanently invalid events to `sessions.events.dlq` and
+   terminate the original only after the dead-letter publish succeeds. If that
+   publish fails, negatively acknowledge the original with a delay.
+
+This provides at-least-once transport with idempotent application. It does not
+make NATS and PostgreSQL one distributed transaction; the stored event ID closes
+the crash window between database commit and stream acknowledgement.
+
 ## Repository Mutation Contract
 
 Define the central operation as:
@@ -103,8 +156,8 @@ read-modify-write operation. The repository must:
 5. Commit all changes or roll everything back as one unit.
 
 The callback is side-effect-free because an adapter may retry it. It receives the
-latest accepted timestamp, active lifecycle, and current state, and returns one
-of `StartSession`, `ReplaceState`, or `EndSession`.
+latest accepted timestamp and event ID, active lifecycle, and current state, and
+returns one of `StartSession`, `ReplaceState`, or `EndSession`.
 
 Each adapter chooses its concurrency mechanism:
 
@@ -264,11 +317,12 @@ The response contains complete matching sessions and all their state history.
 The repository first pages distinct session identities and then loads all states
 for the selected sessions.
 
-`POST /v1/events` remains the event-ingestion endpoint.
+This is the only business HTTP endpoint. There is no event-ingestion HTTP API;
+events arrive through the configured `EventSource`.
 
 ## In-Memory Repository
 
-- Stores `map[SessionKey][]Session` plus latest timestamps.
+- Stores `map[SessionKey][]Session` plus latest timestamps and accepted event IDs.
 - Uses one global `sync.RWMutex`.
 - Mutations hold the write lock.
 - Queries copy a snapshot under the read lock and evaluate the field registry
@@ -279,9 +333,10 @@ for the selected sessions.
 
 ### Schema
 
-`sessions` contains UUID, session-key columns, login/logout times, and a generated
-`tstzrange` lifecycle. It has a partial unique index for one active lifecycle per
-exact session key, B-tree identity/login indexes, and a GiST lifecycle index.
+`sessions` contains UUID, session-key columns, login/logout times, the latest
+accepted event ID for stream deduplication, and a generated `tstzrange` lifecycle.
+It has a partial unique index for one active lifecycle per exact session key,
+B-tree identity/login indexes, and a GiST lifecycle index.
 
 `session_states` contains session UUID, `text[]` tags, valid-from/to times, and a
 generated `tstzrange` activity interval. It has GiST activity, GIN tag, and
@@ -320,28 +375,43 @@ Memory mode defaults:
 
 ```text
 SESSION_STORAGE=memory
+EVENT_STREAM_DRIVER=stdin
 HTTP_ADDR=:8080
 ```
 
-PostgreSQL mode requires:
+Durable stream mode requires:
+
+```text
+EVENT_STREAM_DRIVER=nats
+NATS_URL=nats://...
+NATS_STREAM=SESSION_EVENTS
+NATS_SUBJECT=sessions.events
+NATS_CONSUMER=session-handler
+```
+
+PostgreSQL storage additionally requires:
 
 ```text
 SESSION_STORAGE=postgres
 DATABASE_URL=postgres://...
 ```
 
-Docker Compose starts PostgreSQL, runs versioned migrations, and starts the
-service in PostgreSQL mode.
+Docker Compose starts NATS JetStream and PostgreSQL, runs versioned migrations,
+creates the stream/consumer, and starts the service in NATS/PostgreSQL mode.
 
 - `GET /healthz` reports process liveness.
-- `GET /readyz` reports repository readiness.
+- `GET /readyz` reports repository and event-source readiness.
 
 ## Assumptions and Tradeoffs
 
 - Memory is the default straight-run mode.
+- Stdin is the default straight-run event source; NATS JetStream is the durable
+  Compose event source.
 - The stores are independent; changing modes does not transfer data.
 - User identity is tenant-scoped; IP addresses are intentionally non-unique.
 - Pagination provides stable keyset traversal, not a cross-request snapshot.
-- Raw events and late historical corrections remain out of scope.
+- The application does not store a permanent raw-event log. Broker retention is
+  bounded operational storage, not the session source of truth.
+- Late historical corrections remain out of scope.
 - History retention, authentication, and distributed ordering remain future work.
 

@@ -42,8 +42,9 @@ PR: `Adopt generic query and dual-storage architecture`
 Test first:
 
 - Define checks for identity rules, non-unique IPs, atomic `Mutate`, generic
-  filters, pagination, both adapters, strict test-first workflow, PDF exclusion,
-  and prompt logging.
+  filters, pagination, both storage adapters, stream-only event ingestion,
+  query-only HTTP, stdin/NATS event sources, strict test-first workflow, PDF
+  exclusion, and prompt logging.
 - Run against the old documents and confirm failure.
 
 Implement:
@@ -293,20 +294,59 @@ go test ./...
 
 Confirm both adapters pass the complete repository contract.
 
-## Step 8 - Application Service
+## Step 8 - Stream Event Identity and Idempotency
 
-Branch: `step/08-session-service`
+Branch: `step/08-event-idempotency`
+
+Commit: `feat: add tested stream event idempotency`
+
+PR: `Add atomic stream event deduplication`
+
+Test first:
+
+- Test required UUID event IDs, last accepted event ID snapshots, duplicate
+  detection, and preservation through login/update/logout/relogin.
+- Extend both repository contracts so event ID metadata commits or rolls back in
+  the same unit as the session mutation.
+- Test the PostgreSQL `002_event_identity.sql` migration and memory parity.
+
+Run and confirm failure:
+
+```bash
+go test ./internal/session/... ./internal/repository/... -run EventID
+```
+
+Implement:
+
+- Add event ID metadata to commands, snapshots, and typed mutations without
+  retaining raw event bodies.
+- Store the latest accepted ID per key in memory and on the latest `sessions`
+  row in PostgreSQL.
+- Add a duplicate-event result that performs no mutation and is safe to
+  acknowledge.
+
+Run again:
+
+```bash
+go test ./internal/session/... ./internal/repository/... -run EventID
+go test ./...
+```
+
+## Step 9 - Application Service
+
+Branch: `step/09-session-service`
 
 Commit: `feat: add tested session application service`
 
-PR: `Add storage-neutral command and query service`
+PR: `Add storage-neutral event and query service`
 
 Test first:
 
-- Test event dispatch, normalization, UUID creation, clock capture, structural
-  query validation, cursor forwarding, ordering, cancellation, and repository
-  error propagation.
-- Assert the service has no field-specific query branches.
+- Test stream-event dispatch, normalization, event-ID deduplication, session UUID
+  creation, clock capture, structural query validation, cursor forwarding,
+  ordering, cancellation, and repository error propagation.
+- Assert the service has no stream transport code and no field-specific query
+  branches.
 
 Run and confirm failure:
 
@@ -316,8 +356,9 @@ go test ./internal/service/...
 
 Implement:
 
-- Add event handling and generic query orchestration while leaving field/operator
-  interpretation to repository registries.
+- Add event application and generic query orchestration while leaving delivery
+  acknowledgements to the stream consumer and filter interpretation to repository
+  registries.
 
 Run again:
 
@@ -326,39 +367,48 @@ go test ./internal/service/...
 go test ./...
 ```
 
-## Step 9 - Event HTTP API
+## Step 10 - Event Stream Consumer
 
-Branch: `step/09-event-http-api`
+Branch: `step/10-event-stream`
 
-Commit: `feat: expose tested event ingestion API`
+Commit: `feat: consume tested session event streams`
 
-PR: `Expose event ingestion endpoint`
+PR: `Add stdin and NATS JetStream event consumption`
 
 Test first:
 
-- Test successful commands, malformed JSON, invalid fields, content type, body
-  limits, stale events, transitions, and unsupported methods.
+- Test NDJSON decoding, malformed envelopes, event validation, clean EOF, and
+  cancellation for the stdin adapter.
+- Test NATS stream/consumer creation, durable restart, explicit acknowledgement
+  after commit, duplicate redelivery acknowledgement, delayed negative
+  acknowledgement for transient failures, permanent-error dead lettering plus
+  termination, and no event HTTP route.
+- Test one-message pulls, `MaxAckPending=1` ordering, and consumer shutdown
+  without message loss.
 
 Run and confirm failure:
 
 ```bash
-go test ./internal/httpapi/... -run Event
+go test ./internal/eventstream/...
 ```
 
 Implement:
 
-- Add `POST /v1/events`, DTO conversion, request validation, limits, and errors.
+- Define the storage-neutral `EventSource`/message acknowledgement boundary.
+- Add the stdin and NATS JetStream adapters plus the consumer loop.
+- Extend Compose with NATS JetStream and bounded stream retention.
 
 Run again:
 
 ```bash
-go test ./internal/httpapi/... -run Event
+docker compose up -d nats
+go test ./internal/eventstream/...
 go test ./...
 ```
 
-## Step 10 - Generic Query HTTP API
+## Step 11 - Generic Query HTTP API
 
-Branch: `step/10-query-http-api`
+Branch: `step/11-query-http-api`
 
 Commit: `feat: expose tested generic session queries`
 
@@ -368,7 +418,8 @@ Test first:
 
 - Test `Field`/`Operator`/`Value` decoding, missing filters, invalid JSON shapes,
   unknown fields, unsupported operators, limits, cursors, and next-page output.
-- Test complete histories and default activity-at-now behavior.
+- Test complete histories, default activity-at-now behavior, and confirm no event
+  ingestion route exists.
 
 Run and confirm failure:
 
@@ -378,8 +429,8 @@ go test ./internal/httpapi/... -run Query
 
 Implement:
 
-- Add `POST /v1/sessions/query`, generic DTO conversion, pagination input, and
-  response encoding.
+- Add only `POST /v1/sessions/query`, generic DTO conversion, pagination input,
+  and response encoding. Keep health/readiness as operational endpoints.
 
 Run again:
 
@@ -388,18 +439,19 @@ go test ./internal/httpapi/... -run Query
 go test ./...
 ```
 
-## Step 11 - Runtime Selection and Server
+## Step 12 - Runtime Selection and Server
 
-Branch: `step/11-runnable-server`
+Branch: `step/12-runnable-server`
 
-Commit: `feat: add tested runtime storage selection`
+Commit: `feat: add tested runtime adapter selection`
 
 PR: `Add vanilla and Docker Compose runtime modes`
 
 Test first:
 
-- Test default memory, explicit drivers, missing PostgreSQL URL, invalid driver,
-  readiness, shutdown, and repository cleanup.
+- Test default memory/stdin mode, explicit storage and event-stream drivers,
+  missing PostgreSQL/NATS URLs, invalid drivers, readiness, stdin EOF, shutdown,
+  consumer cancellation, and repository/source cleanup.
 
 Run and confirm failure:
 
@@ -409,8 +461,9 @@ go test ./cmd/... ./internal/config/...
 
 Implement:
 
-- Add configuration, adapter construction, timeouts, health/readiness, graceful
-  shutdown, migration binary, and Compose startup ordering.
+- Add storage and event-source configuration, adapter construction, timeouts,
+  query-only HTTP serving, health/readiness, graceful consumer/server shutdown,
+  migration binary, and Compose startup ordering.
 
 Run again:
 
@@ -419,21 +472,24 @@ go test ./cmd/... ./internal/config/...
 go test ./...
 ```
 
-Smoke-test both `go run ./cmd/server` and `docker compose up --build`.
+Smoke-test NDJSON piped into `go run ./cmd/server` and
+`docker compose up --build` with NATS/PostgreSQL.
 
-## Step 12 - End-to-End Parity and Concurrency
+## Step 13 - End-to-End Parity and Concurrency
 
-Branch: `step/12-integration-tests`
+Branch: `step/13-integration-tests`
 
-Commit: `test: add adapter parity and concurrency coverage`
+Commit: `test: add stream-to-query parity coverage`
 
-PR: `Add end-to-end adapter parity tests`
+PR: `Add end-to-end stream and adapter parity tests`
 
 Test first:
 
-- Add HTTP lifecycle, identity, shared-IP, adapter parity, filter parity,
-  pagination, concurrent mutation/query, PostgreSQL persistence, memory reset,
-  and rollback scenarios.
+- Publish lifecycle events through stdin and NATS, then verify them only through
+  the query HTTP API.
+- Test identity, shared IPs, adapter/filter/pagination parity, acknowledgement,
+  crash-window redelivery, event-ID deduplication, dead lettering, concurrent
+  mutation/query, PostgreSQL persistence, memory reset, and rollback.
 
 Run and confirm failures:
 
@@ -453,26 +509,28 @@ go test ./...
 go test -race ./...
 ```
 
-Repeat contention and pagination tests to detect flakes.
+Repeat stream redelivery, contention, and pagination tests to detect flakes.
 
-## Step 13 - Documentation
+## Step 14 - Documentation
 
-Branch: `step/13-documentation`
+Branch: `step/14-documentation`
 
-Commit: `docs: complete dual storage documentation`
+Commit: `docs: complete stream and dual storage documentation`
 
-PR: `Document generic querying and both storage modes`
+PR: `Document stream ingestion and query-only HTTP`
 
 Test first:
 
-- Define clean-checkout checks for memory startup, Compose startup, migrations,
-  generic query examples, pagination, tests, prompt logging, and excluded files.
+- Define clean-checkout checks for stdin/memory startup, NATS/PostgreSQL Compose
+  startup, migrations, publishing events, query examples, pagination, tests,
+  prompt logging, and excluded files.
 - Run against incomplete documentation and record failure.
 
 Implement:
 
-- Document both storage modes, event API, generic query specification, operators,
-  pagination, schema, identity rules, concurrency, and tradeoffs.
+- Document both storage modes, both stream modes, event envelopes, delivery and
+  deduplication behavior, query-only HTTP, generic filters, pagination, schema,
+  identity rules, concurrency, and tradeoffs.
 - Complete `PROMPTS.md`.
 
 Run again:
@@ -485,8 +543,14 @@ Run again:
 
 - Every code PR follows tests -> failing run -> implementation -> passing run.
 - Every PR description records red and green evidence.
-- Memory runs without Docker; Compose runs with persistent PostgreSQL.
-- Both adapters pass the same mutation, query, and pagination contracts.
+- Memory/stdin runs without Docker; Compose runs with NATS JetStream and
+  persistent PostgreSQL.
+- Events enter only through stdin or NATS; HTTP exposes queries and operational
+  health endpoints only.
+- Acknowledgement happens after mutation commit, and redelivery is idempotent by
+  event ID.
+- Both storage adapters pass the same mutation, query, pagination, and event-ID
+  contracts.
 - Usernames are tenant-scoped and IP addresses are non-unique.
 - Domain transition rules exist once.
 - PostgreSQL mutations are transactional; memory mutations are race-free.
