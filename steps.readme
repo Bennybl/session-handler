@@ -1,0 +1,492 @@
+# Strict Test-First Implementation Steps
+
+## Required Cycle
+
+Every code step follows this exact sequence:
+
+1. **Write tests first.**
+2. **Run them and confirm they fail for the expected missing behavior.**
+3. **Implement only the behavior described by those tests.**
+4. **Run the same tests again and confirm they pass.**
+5. Run the full regression suite.
+6. Run the race detector for shared-state or concurrency changes.
+7. Commit tests and implementation together.
+8. Record red and green commands and summaries in the PR description.
+9. Pause for review and merge before the next step.
+
+Unexpectedly passing tests must be corrected before implementation. Failures
+caused only by unrelated setup problems do not count as the red phase.
+
+Each step branches from newly merged `main`, uses one focused commit, opens one
+PR, and pauses for review.
+
+## Bootstrap
+
+Before Step 0:
+
+1. Re-authenticate GitHub CLI.
+2. Initialize `main` with one empty base commit.
+3. Create private repository `Bennybl/session-handler`.
+4. Push `main`.
+
+Use Go 1.24 and module path `github.com/Bennybl/session-handler`.
+
+## Step 0 - Plan Documents
+
+Branch: `step/00-project-plan`
+
+Commit: `docs: adopt generic query and dual storage plan`
+
+PR: `Adopt generic query and dual-storage architecture`
+
+Test first:
+
+- Define checks for identity rules, non-unique IPs, atomic `Mutate`, generic
+  filters, pagination, both adapters, strict test-first workflow, PDF exclusion,
+  and prompt logging.
+- Run against the old documents and confirm failure.
+
+Implement:
+
+- Replace `plan.readme` and `steps.readme`.
+- Add `.gitignore` excluding `HA.pdf`.
+- Add `PROMPTS.md`.
+
+Run again:
+
+- Repeat the checks and confirm success.
+- Confirm no code, PDF, or credentials are tracked.
+
+## Step 1 - Domain and Query Types
+
+Branch: `step/01-session-domain`
+
+Commit: `feat: add tested session and query domain`
+
+PR: `Add tested session lifecycle and query types`
+
+Test first:
+
+- Test login/update/logout/relogin transitions.
+- Test username identity within a tenant and reuse across tenants.
+- Test multiple users sharing an IP and one user using multiple IPs.
+- Test active uniqueness only for the complete session key.
+- Test tags, stale events, equal times, and interval boundaries.
+- Test generic `Filter`, `QuerySpec`, page request, and result types.
+
+Run and confirm failure:
+
+```bash
+go test ./internal/session
+```
+
+Implement:
+
+- Add session, state, snapshot, typed mutation, filter, pagination, normalization,
+  error, and temporal predicate types.
+
+Run again:
+
+```bash
+go test ./internal/session
+go vet ./internal/session
+go test ./...
+```
+
+## Step 2 - Repository Contract
+
+Branch: `step/02-repository-contract`
+
+Commit: `test: define atomic repository contract`
+
+PR: `Define atomic mutation and generic query contract`
+
+Test first:
+
+- Write reusable contract tests for atomic per-key mutation, rollback, retry-safe
+  callbacks, same-key serialization, consistent queries, and copy isolation.
+- Add generic query tests for supported fields/operators, invalid combinations,
+  same-state activity/tag matching, and pagination.
+- Run against an incomplete adapter and confirm expected failures.
+
+Implement:
+
+- Define `SessionRepository.Mutate(ctx, key, fn)`.
+- Define query, page, cursor, result, and repository error contracts.
+- Define the reusable adapter contract-suite entry point.
+
+Run again:
+
+- Confirm the contract infrastructure compiles and only intentional stub cases
+  remain failing.
+- Run all domain tests.
+
+## Step 3 - Cursor Codec and Query Registry Foundation
+
+Branch: `step/03-query-foundation`
+
+Commit: `feat: add tested query registry and cursor codec`
+
+PR: `Add generic query registry and pagination foundation`
+
+Test first:
+
+- Test registry lookup, field/operator validation, typed value normalization,
+  query fingerprinting, cursor round trips, malformed cursors, mismatched query
+  cursors, storage-mode mismatches, default/max limits, and stable sort tuples.
+
+Run and confirm failure:
+
+```bash
+go test ./internal/query/...
+```
+
+Implement:
+
+- Add shared registry metadata, structural query validation, fingerprinting,
+  versioned cursor codec, and pagination helpers.
+
+Run again:
+
+```bash
+go test ./internal/query/...
+go test ./...
+```
+
+## Step 4 - In-Memory Repository
+
+Branch: `step/04-memory-repository`
+
+Commit: `feat: add tested in-memory repository`
+
+PR: `Add in-memory mutation and generic querying`
+
+Test first:
+
+- Register memory with the repository contract.
+- Test deep copies and concurrent access.
+- Test every field/operator registry entry.
+- Test all state filters target the same state.
+- Test keyset pagination, default-now persistence in cursors, and history loading.
+
+Run and confirm failure:
+
+```bash
+go test ./internal/repository/memory/...
+```
+
+Implement:
+
+- Add map storage, latest timestamps, global locking, atomic mutation, memory
+  predicate registry, stable sorting, and cursor seeking.
+
+Run again:
+
+```bash
+go test ./internal/repository/memory/...
+go test -race ./internal/repository/memory/...
+go test ./...
+```
+
+## Step 5 - PostgreSQL Schema and Migrations
+
+Branch: `step/05-postgres-schema`
+
+Commit: `feat: add tested PostgreSQL schema`
+
+PR: `Add PostgreSQL schema and migrations`
+
+Test first:
+
+- Test clean/repeated migrations, rollback, constraints, foreign keys, and
+  indexes.
+- Test same username in different tenants is allowed.
+- Test shared IPs are allowed.
+- Test two active lifecycles for one full session key are rejected.
+
+Run against an empty database and confirm failure.
+
+Implement:
+
+- Add Compose, migration runner, tables, generated ranges, constraints, and
+  indexes.
+
+Run again:
+
+```bash
+docker compose up -d postgres
+go test ./internal/postgres/migrations/...
+go test ./...
+```
+
+## Step 6 - PostgreSQL Mutation Repository
+
+Branch: `step/06-postgres-mutation`
+
+Commit: `feat: add tested PostgreSQL atomic mutations`
+
+PR: `Add PostgreSQL atomic mutation support`
+
+Test first:
+
+- Run mutation contract tests against PostgreSQL.
+- Test transaction rollback, callback error rollback, same-key row locking,
+  different-key concurrency, persistence, and context cancellation.
+
+Run and confirm failure:
+
+```bash
+go test ./internal/repository/postgres/... -run Mutate
+```
+
+Implement:
+
+- Add connection pooling, coordination-row locking, snapshot loading, typed
+  mutation persistence, latest timestamp updates, and transaction retry handling.
+
+Run again:
+
+```bash
+go test ./internal/repository/postgres/... -run Mutate
+go test -race ./internal/repository/...
+go test ./...
+```
+
+## Step 7 - PostgreSQL Generic Queries
+
+Branch: `step/07-postgres-query`
+
+Commit: `feat: add tested PostgreSQL generic queries`
+
+PR: `Add PostgreSQL registry queries and pagination`
+
+Test first:
+
+- Run shared query and pagination contracts against PostgreSQL.
+- Test every registry entry and unsupported combination.
+- Test SQL injection-shaped field/operator/value inputs.
+- Test state filters compile into one correlated state predicate.
+- Test parameter binding, distinct session paging, keyset boundaries, and loading
+  complete histories.
+
+Run and confirm failure:
+
+```bash
+go test ./internal/repository/postgres/... -run Query
+```
+
+Implement:
+
+- Add PostgreSQL field registry, parameterized predicate builder, state-scope
+  grouping, keyset SQL, distinct ID paging, and complete history loading.
+
+Run again:
+
+```bash
+go test ./internal/repository/postgres/... -run Query
+go test ./internal/repository/postgres/...
+go test ./...
+```
+
+Confirm both adapters pass the complete repository contract.
+
+## Step 8 - Application Service
+
+Branch: `step/08-session-service`
+
+Commit: `feat: add tested session application service`
+
+PR: `Add storage-neutral command and query service`
+
+Test first:
+
+- Test event dispatch, normalization, UUID creation, clock capture, structural
+  query validation, cursor forwarding, ordering, cancellation, and repository
+  error propagation.
+- Assert the service has no field-specific query branches.
+
+Run and confirm failure:
+
+```bash
+go test ./internal/service/...
+```
+
+Implement:
+
+- Add event handling and generic query orchestration while leaving field/operator
+  interpretation to repository registries.
+
+Run again:
+
+```bash
+go test ./internal/service/...
+go test ./...
+```
+
+## Step 9 - Event HTTP API
+
+Branch: `step/09-event-http-api`
+
+Commit: `feat: expose tested event ingestion API`
+
+PR: `Expose event ingestion endpoint`
+
+Test first:
+
+- Test successful commands, malformed JSON, invalid fields, content type, body
+  limits, stale events, transitions, and unsupported methods.
+
+Run and confirm failure:
+
+```bash
+go test ./internal/httpapi/... -run Event
+```
+
+Implement:
+
+- Add `POST /v1/events`, DTO conversion, request validation, limits, and errors.
+
+Run again:
+
+```bash
+go test ./internal/httpapi/... -run Event
+go test ./...
+```
+
+## Step 10 - Generic Query HTTP API
+
+Branch: `step/10-query-http-api`
+
+Commit: `feat: expose tested generic session queries`
+
+PR: `Expose generic paginated session queries`
+
+Test first:
+
+- Test `Field`/`Operator`/`Value` decoding, missing filters, invalid JSON shapes,
+  unknown fields, unsupported operators, limits, cursors, and next-page output.
+- Test complete histories and default activity-at-now behavior.
+
+Run and confirm failure:
+
+```bash
+go test ./internal/httpapi/... -run Query
+```
+
+Implement:
+
+- Add `POST /v1/sessions/query`, generic DTO conversion, pagination input, and
+  response encoding.
+
+Run again:
+
+```bash
+go test ./internal/httpapi/... -run Query
+go test ./...
+```
+
+## Step 11 - Runtime Selection and Server
+
+Branch: `step/11-runnable-server`
+
+Commit: `feat: add tested runtime storage selection`
+
+PR: `Add vanilla and Docker Compose runtime modes`
+
+Test first:
+
+- Test default memory, explicit drivers, missing PostgreSQL URL, invalid driver,
+  readiness, shutdown, and repository cleanup.
+
+Run and confirm failure:
+
+```bash
+go test ./cmd/... ./internal/config/...
+```
+
+Implement:
+
+- Add configuration, adapter construction, timeouts, health/readiness, graceful
+  shutdown, migration binary, and Compose startup ordering.
+
+Run again:
+
+```bash
+go test ./cmd/... ./internal/config/...
+go test ./...
+```
+
+Smoke-test both `go run ./cmd/server` and `docker compose up --build`.
+
+## Step 12 - End-to-End Parity and Concurrency
+
+Branch: `step/12-integration-tests`
+
+Commit: `test: add adapter parity and concurrency coverage`
+
+PR: `Add end-to-end adapter parity tests`
+
+Test first:
+
+- Add HTTP lifecycle, identity, shared-IP, adapter parity, filter parity,
+  pagination, concurrent mutation/query, PostgreSQL persistence, memory reset,
+  and rollback scenarios.
+
+Run and confirm failures:
+
+```bash
+go test ./internal/integration/...
+```
+
+Implement:
+
+- Make only the minimum production corrections exposed by the tests.
+
+Run again:
+
+```bash
+go test ./internal/integration/...
+go test ./...
+go test -race ./...
+```
+
+Repeat contention and pagination tests to detect flakes.
+
+## Step 13 - Documentation
+
+Branch: `step/13-documentation`
+
+Commit: `docs: complete dual storage documentation`
+
+PR: `Document generic querying and both storage modes`
+
+Test first:
+
+- Define clean-checkout checks for memory startup, Compose startup, migrations,
+  generic query examples, pagination, tests, prompt logging, and excluded files.
+- Run against incomplete documentation and record failure.
+
+Implement:
+
+- Document both storage modes, event API, generic query specification, operators,
+  pagination, schema, identity rules, concurrency, and tradeoffs.
+- Complete `PROMPTS.md`.
+
+Run again:
+
+- Follow every command from a clean checkout.
+- Run the full test and race suites.
+- Confirm no PDF, secrets, or machine-specific paths are tracked.
+
+## Final Acceptance Criteria
+
+- Every code PR follows tests -> failing run -> implementation -> passing run.
+- Every PR description records red and green evidence.
+- Memory runs without Docker; Compose runs with persistent PostgreSQL.
+- Both adapters pass the same mutation, query, and pagination contracts.
+- Usernames are tenant-scoped and IP addresses are non-unique.
+- Domain transition rules exist once.
+- PostgreSQL mutations are transactional; memory mutations are race-free.
+- Generic SQL queries are registry-based and parameterized.
+- Activity and tag filters always match the same state.
+- Both adapters return equivalent ordered pages and complete histories.

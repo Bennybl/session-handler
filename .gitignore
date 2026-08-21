@@ -1,0 +1,19 @@
+# Assignment source document is local reference only.
+HA.pdf
+
+# Local configuration and secrets.
+.env
+.env.*
+!.env.example
+
+# Go build and test output.
+*.exe
+*.test
+coverage.out
+
+# Editor and operating-system files.
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
