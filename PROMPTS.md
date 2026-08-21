@@ -35,3 +35,10 @@ implementing the assignment.
     define the atomic `SessionRepository.Mutate(ctx, key, fn)` boundary and a
     reusable test contract for future memory and PostgreSQL adapters, using the
     required red-then-green workflow.
+15. After the repository-contract PR was approved and merged, implement only
+    Step 3: create the generic query registry, typed value normalization,
+    deterministic query fingerprints, versioned adapter-bound cursors, page-limit
+    handling, and stable session sort keys using tests first.
+16. Before merging Step 3, make typed `IntervalValue` inputs use the same
+    timestamp validation as map inputs: reject zero, equal, and reversed bounds,
+    preserve open-ended intervals, and normalize accepted bounds to UTC.
