@@ -11,6 +11,12 @@ import (
 	"github.com/Bennybl/session-handler/internal/session"
 )
 
+const (
+	contractSession1ID = "00000000-0000-0000-0000-000000000001"
+	contractSession2ID = "00000000-0000-0000-0000-000000000002"
+	contractSession3ID = "00000000-0000-0000-0000-000000000003"
+)
+
 type Factory func(t *testing.T) repository.SessionRepository
 
 type Case struct {
@@ -53,7 +59,7 @@ func testLifecycleSnapshots(t *testing.T, factory Factory) {
 			t.Fatalf("initial snapshot = %+v, want empty", snapshot)
 		}
 		return session.DecideLogin(snapshot, session.LoginCommand{
-			SessionID: "session-1",
+			SessionID: contractSession1ID,
 			Key:       key,
 			Tags:      []string{"user"},
 			Timestamp: loginAt,
@@ -64,7 +70,7 @@ func testLifecycleSnapshots(t *testing.T, factory Factory) {
 	}
 
 	err = repo.Mutate(ctx, key, func(snapshot session.CurrentSessionSnapshot) (session.Mutation, error) {
-		assertSnapshot(t, snapshot, "session-1", loginAt, loginAt, []string{"user"})
+		assertSnapshot(t, snapshot, contractSession1ID, loginAt, loginAt, []string{"user"})
 		return session.DecideUpdate(snapshot, session.UpdateCommand{
 			Key:       key,
 			Tags:      []string{"admin", "user"},
@@ -76,7 +82,7 @@ func testLifecycleSnapshots(t *testing.T, factory Factory) {
 	}
 
 	err = repo.Mutate(ctx, key, func(snapshot session.CurrentSessionSnapshot) (session.Mutation, error) {
-		assertSnapshot(t, snapshot, "session-1", loginAt, updateAt, []string{"admin", "user"})
+		assertSnapshot(t, snapshot, contractSession1ID, loginAt, updateAt, []string{"admin", "user"})
 		if len(snapshot.Active.States) != 2 || snapshot.Active.States[0].ValidTo == nil || !snapshot.Active.States[0].ValidTo.Equal(updateAt) {
 			t.Fatalf("states after update = %+v", snapshot.Active.States)
 		}
@@ -102,7 +108,7 @@ func testLifecycleSnapshots(t *testing.T, factory Factory) {
 
 	err = repo.Mutate(ctx, key, func(snapshot session.CurrentSessionSnapshot) (session.Mutation, error) {
 		return session.DecideLogin(snapshot, session.LoginCommand{
-			SessionID: "session-2",
+			SessionID: contractSession2ID,
 			Key:       key,
 			Tags:      []string{"user"},
 			Timestamp: logoutAt.Add(time.Hour),
@@ -119,7 +125,7 @@ func testCallbackRollbackAndIsolation(t *testing.T, factory Factory) {
 	ctx := context.Background()
 	key := mustKey(t, "tenant-a", "alice", "192.0.2.10")
 	loginAt := mustTime(t, "2026-08-21T10:00:00Z")
-	seedLogin(t, repo, key, "session-1", loginAt, []string{"user"})
+	seedLogin(t, repo, key, contractSession1ID, loginAt, []string{"user"})
 
 	rollbackError := errors.New("rollback")
 	err := repo.Mutate(ctx, key, func(snapshot session.CurrentSessionSnapshot) (session.Mutation, error) {
@@ -194,8 +200,8 @@ func testGenericStateScopedFilters(t *testing.T, factory Factory) {
 	at := mustTime(t, "2026-08-21T10:00:00Z")
 	alice := mustKey(t, "tenant-a", "alice", "192.0.2.10")
 	bob := mustKey(t, "tenant-a", "bob", "192.0.2.10")
-	seedLogin(t, repo, alice, "session-1", at, []string{"admin", "user"})
-	seedLogin(t, repo, bob, "session-2", at, []string{"user"})
+	seedLogin(t, repo, alice, contractSession1ID, at, []string{"admin", "user"})
+	seedLogin(t, repo, bob, contractSession2ID, at, []string{"user"})
 
 	result, err := repo.Query(ctx, session.QuerySpec{
 		Filters: []session.Filter{
@@ -209,8 +215,8 @@ func testGenericStateScopedFilters(t *testing.T, factory Factory) {
 	if err != nil {
 		t.Fatalf("Query() error = %v", err)
 	}
-	if len(result.Sessions) != 1 || result.Sessions[0].ID != "session-1" {
-		t.Fatalf("Query() sessions = %+v, want session-1", result.Sessions)
+	if len(result.Sessions) != 1 || result.Sessions[0].ID != contractSession1ID {
+		t.Fatalf("Query() sessions = %+v, want %s", result.Sessions, contractSession1ID)
 	}
 }
 
@@ -219,9 +225,10 @@ func testPaginationAndStableCursors(t *testing.T, factory Factory) {
 	repo := newRepository(t, factory)
 	ctx := context.Background()
 	at := mustTime(t, "2026-08-21T10:00:00Z")
+	ids := []string{contractSession1ID, contractSession2ID, contractSession3ID}
 	for index, username := range []string{"alice", "bob", "charlie"} {
 		key := mustKey(t, "tenant-a", username, "192.0.2.10")
-		seedLogin(t, repo, key, "session-"+username, at.Add(time.Duration(index)*time.Second), []string{"user"})
+		seedLogin(t, repo, key, ids[index], at.Add(time.Duration(index)*time.Second), []string{"user"})
 	}
 
 	spec := session.QuerySpec{Page: session.PageRequest{Limit: 2}, EvaluatedAt: at.Add(time.Minute)}
@@ -252,7 +259,7 @@ func testQueryResultIsolation(t *testing.T, factory Factory) {
 	ctx := context.Background()
 	at := mustTime(t, "2026-08-21T10:00:00Z")
 	key := mustKey(t, "tenant-a", "alice", "192.0.2.10")
-	seedLogin(t, repo, key, "session-1", at, []string{"user"})
+	seedLogin(t, repo, key, contractSession1ID, at, []string{"user"})
 	spec := session.QuerySpec{Page: session.PageRequest{Limit: 50}, EvaluatedAt: at.Add(time.Minute)}
 
 	first, err := repo.Query(ctx, spec)
