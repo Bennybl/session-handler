@@ -75,3 +75,7 @@ implementing the assignment.
     8 with tests first: require UUID event IDs, normalize and propagate them,
     atomically persist the latest ID in both adapters, and make immediate stream
     redelivery a successful duplicate no-op without retaining raw events.
+25. Start Step 9 locally without committing or pushing: add the storage-neutral
+    application service with test-first event dispatch, normalization, stable
+    session UUID generation, duplicate handling, generic query forwarding,
+    clock capture, cancellation, and error propagation.
