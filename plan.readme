@@ -109,7 +109,9 @@ of `StartSession`, `ReplaceState`, or `EndSession`.
 Each adapter chooses its concurrency mechanism:
 
 - Memory uses a write lock and copy-on-mutate behavior.
-- PostgreSQL uses a transaction and per-key row lock.
+- PostgreSQL uses a transaction-scoped advisory lock derived from the complete
+  session key, then locks any matching session rows. The advisory lock also
+  serializes the first login, when no session row exists yet.
 - A future adapter may use optimistic concurrency, compare-and-swap, and retries.
 
 Repository guarantees:
@@ -277,9 +279,6 @@ for the selected sessions.
 
 ### Schema
 
-`session_keys` contains tenant ID, username, `inet` IP, and latest event time,
-with a composite primary key over tenant, username, and IP.
-
 `sessions` contains UUID, session-key columns, login/logout times, and a generated
 `tstzrange` lifecycle. It has a partial unique index for one active lifecycle per
 exact session key, B-tree identity/login indexes, and a GiST lifecycle index.
@@ -292,13 +291,20 @@ session/state-order indexes.
 
 Every mutation transaction:
 
-1. Ensures the `session_keys` row exists.
-2. Locks it using `SELECT ... FOR UPDATE`.
-3. Loads the current snapshot.
+1. Acquires a transaction-scoped advisory lock derived from the canonical
+   `(tenantId, username, ip)` tuple.
+2. Loads the latest matching lifecycle and locks matching `sessions` rows using
+   `SELECT ... FOR UPDATE`.
+3. Derives the latest event timestamp and current snapshot from the session and
+   state history.
 4. Executes the shared callback.
 5. Applies the typed mutation.
-6. Updates the latest event time.
-7. Commits or rolls back completely.
+6. Commits or rolls back completely.
+
+The advisory lock is required for a key's first login because there is no row to
+lock yet. Hash collisions may serialize unrelated keys but cannot violate
+correctness. PostgreSQL stores only the two domain tables: `sessions` and
+`session_states`; the migration ledger is infrastructure metadata.
 
 ### Dynamic queries
 

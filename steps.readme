@@ -230,8 +230,9 @@ PR: `Add PostgreSQL atomic mutation support`
 Test first:
 
 - Run mutation contract tests against PostgreSQL.
-- Test transaction rollback, callback error rollback, same-key row locking,
-  different-key concurrency, persistence, and context cancellation.
+- Test transaction rollback, callback error rollback, same-key advisory locking
+  including the first login, matching session-row locks, different-key
+  concurrency, persistence, and context cancellation.
 
 Run and confirm failure:
 
@@ -241,8 +242,10 @@ go test ./internal/repository/postgres/... -run Mutate
 
 Implement:
 
-- Add connection pooling, coordination-row locking, snapshot loading, typed
-  mutation persistence, latest timestamp updates, and transaction retry handling.
+- Add connection pooling, transaction-scoped advisory locking derived from the
+  canonical session key, matching session-row locking, snapshot/latest timestamp
+  derivation from lifecycle history, typed mutation persistence, and transaction
+  retry handling.
 
 Run again:
 
