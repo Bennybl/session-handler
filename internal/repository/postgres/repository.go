@@ -79,7 +79,7 @@ func (r *Repository) Mutate(ctx context.Context, key session.SessionKey, fn repo
 	})
 }
 
-func (r *Repository) Query(ctx context.Context, _ session.QuerySpec) (session.QueryResult, error) {
+func (r *Repository) Query(ctx context.Context, spec session.QuerySpec) (session.QueryResult, error) {
 	if ctx == nil {
 		return session.QueryResult{}, fmt.Errorf("%w: context is required", session.ErrInvalidInput)
 	}
@@ -91,7 +91,7 @@ func (r *Repository) Query(ctx context.Context, _ session.QuerySpec) (session.Qu
 	if r.closed {
 		return session.QueryResult{}, repository.ErrClosed
 	}
-	return session.QueryResult{}, fmt.Errorf("%w: PostgreSQL querying is not implemented", repository.ErrInvalidQuery)
+	return r.query(ctx, spec)
 }
 
 func (r *Repository) Close() error {

@@ -67,3 +67,7 @@ implementing the assignment.
     a stream rather than an HTTP endpoint. Keep HTTP query-only, provide a
     zero-dependency stdin stream and durable NATS JetStream adapter, and account
     for acknowledgement, redelivery, ordering, and atomic event-ID deduplication.
+23. After the PostgreSQL mutation PR was approved and merged, implement only
+    Step 7 with tests first: add PostgreSQL declarative registry queries,
+    same-state predicates, parameter binding, distinct keyset pagination, and
+    complete session-history loading, then open its dedicated PR.
