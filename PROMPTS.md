@@ -86,3 +86,7 @@ implementing the assignment.
 27. Start Step 11 locally without committing or pushing: add the test-first,
     query-only HTTP API with strict generic filter decoding, pagination, complete
     history responses, default-now behavior, and no event-ingestion route.
+28. Start Step 12 locally without committing or pushing: add test-first runtime
+    configuration and adapter selection, health/readiness, graceful lifecycle
+    management, runnable server and migration binaries, and ordered Compose
+    startup for PostgreSQL and NATS.
