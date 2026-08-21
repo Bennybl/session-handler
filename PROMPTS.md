@@ -90,3 +90,7 @@ implementing the assignment.
     configuration and adapter selection, health/readiness, graceful lifecycle
     management, runnable server and migration binaries, and ordered Compose
     startup for PostgreSQL and NATS.
+29. Start Step 13 locally without committing or pushing: add black-box stream-to-
+    query integration coverage for memory/stdin and PostgreSQL/NATS, including
+    parity, concurrency, redelivery deduplication, acknowledgements, dead letters,
+    persistence, reset, pagination, and rollback.
