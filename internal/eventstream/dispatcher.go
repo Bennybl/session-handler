@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"sync"
 	"time"
 
@@ -30,6 +31,11 @@ type job struct {
 	result chan error
 }
 
+// Dispatcher is the sole owner of application-level ingestion concurrency.
+// Correctness requires every write to enter through Submit with a canonical
+// SessionKey, a fixed partition count, one exclusive worker per partition, and
+// all retries completed inline before the worker advances. This also assumes a
+// single application process writes to the in-memory database.
 type Dispatcher struct {
 	applier       EventApplier
 	options       Options
@@ -94,7 +100,21 @@ func (d *Dispatcher) Start() error {
 }
 
 func (d *Dispatcher) PartitionFor(event service.Event) int {
-	return int(service.HashSessionKey(event.Key) % uint64(len(d.queues)))
+	return int(hashSessionKey(event.Key) % uint64(len(d.queues)))
+}
+
+func hashSessionKey(key session.SessionKey) uint64 {
+	hash := fnv.New64a()
+	for _, value := range []string{key.TenantID, key.Username, key.IP} {
+		length := uint64(len(value))
+		var prefix [8]byte
+		for index := range prefix {
+			prefix[index] = byte(length >> (8 * index))
+		}
+		_, _ = hash.Write(prefix[:])
+		_, _ = hash.Write([]byte(value))
+	}
+	return hash.Sum64()
 }
 
 func (d *Dispatcher) Submit(ctx context.Context, event service.Event) error {

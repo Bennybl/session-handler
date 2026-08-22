@@ -3,6 +3,7 @@ package eventstream
 import (
 	"context"
 	"errors"
+	"reflect"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -125,6 +126,59 @@ func TestOneWorkerProcessesPartitionSequentially(t *testing.T) {
 	submissions.Wait()
 	if maximum.Load() != 1 {
 		t.Fatalf("maximum concurrent applies in one partition = %d, want 1", maximum.Load())
+	}
+}
+
+func TestUpdateCannotOvertakeLoginForSameKey(t *testing.T) {
+	loginEntered := make(chan struct{})
+	releaseLogin := make(chan struct{})
+	var releaseOnce sync.Once
+	defer releaseOnce.Do(func() { close(releaseLogin) })
+	updateEntered := make(chan struct{})
+	var orderMu sync.Mutex
+	var order []service.EventType
+	applier := applierFunc(func(_ context.Context, event service.Event) error {
+		orderMu.Lock()
+		order = append(order, event.Type)
+		orderMu.Unlock()
+		if event.Type == service.EventLogin {
+			close(loginEntered)
+			<-releaseLogin
+		} else {
+			close(updateEntered)
+		}
+		return nil
+	})
+	dispatcher := newDispatcher(t, applier, Options{PartitionCount: 4, QueueCapacity: 2, RetryAttempts: 1})
+	login := trustedEvent(t, sessiontest.EventID(40), "tenant-a", "alice", "192.0.2.10")
+	login.Type = service.EventLogin
+	update := trustedEvent(t, sessiontest.EventID(41), "tenant-a", "alice", "192.0.2.10")
+	results := make(chan error, 2)
+	go func() { results <- dispatcher.Submit(context.Background(), login) }()
+	sessiontest.Await(t, loginEntered, "LOGIN service processing")
+	go func() { results <- dispatcher.Submit(context.Background(), update) }()
+
+	deadline := time.Now().Add(time.Second)
+	queue := dispatcher.queues[dispatcher.PartitionFor(update)]
+	for len(queue) == 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if len(queue) == 0 {
+		t.Fatal("UPDATE was not queued behind LOGIN")
+	}
+	if !sessiontest.Blocked(updateEntered) {
+		t.Fatal("UPDATE entered service processing before LOGIN completed")
+	}
+	releaseOnce.Do(func() { close(releaseLogin) })
+	for range 2 {
+		if err := <-results; err != nil {
+			t.Fatal(err)
+		}
+	}
+	orderMu.Lock()
+	defer orderMu.Unlock()
+	if !reflect.DeepEqual(order, []service.EventType{service.EventLogin, service.EventUpdate}) {
+		t.Fatalf("service order = %v, want LOGIN then UPDATE", order)
 	}
 }
 

@@ -8,11 +8,6 @@ import (
 	"time"
 )
 
-const (
-	MutationGuardNone    = "none"
-	MutationGuardStriped = "striped"
-)
-
 type LookupEnv func(string) (string, bool)
 
 type Config struct {
@@ -21,8 +16,6 @@ type Config struct {
 	PartitionQueueCapacity int
 	EventRetryAttempts     int
 	EventRetryDelay        time.Duration
-	MutationGuard          string
-	MutationGuardStripes   int
 	StartupTimeout         time.Duration
 	ShutdownTimeout        time.Duration
 }
@@ -33,7 +26,7 @@ func FromLookup(lookup LookupEnv) (Config, error) {
 	if lookup == nil {
 		return Config{}, fmt.Errorf("environment lookup is required")
 	}
-	configuration := Config{HTTPAddr: valueOrDefault(lookup, "HTTP_ADDR", ":8080"), MutationGuard: strings.ToLower(valueOrDefault(lookup, "SESSION_MUTATION_GUARD", MutationGuardNone))}
+	configuration := Config{HTTPAddr: valueOrDefault(lookup, "HTTP_ADDR", ":8080")}
 	var err error
 	if configuration.PartitionCount, err = integer(lookup, "PARTITION_COUNT", 16); err != nil {
 		return Config{}, err
@@ -42,9 +35,6 @@ func FromLookup(lookup LookupEnv) (Config, error) {
 		return Config{}, err
 	}
 	if configuration.EventRetryAttempts, err = integer(lookup, "EVENT_RETRY_ATTEMPTS", 3); err != nil {
-		return Config{}, err
-	}
-	if configuration.MutationGuardStripes, err = integer(lookup, "MUTATION_GUARD_STRIPES", 64); err != nil {
 		return Config{}, err
 	}
 	if configuration.EventRetryDelay, err = duration(lookup, "EVENT_RETRY_DELAY", 100*time.Millisecond); err != nil {
@@ -77,12 +67,6 @@ func (configuration Config) Validate() error {
 	}
 	if configuration.EventRetryDelay <= 0 {
 		return fmt.Errorf("EVENT_RETRY_DELAY must be positive")
-	}
-	if configuration.MutationGuard != MutationGuardNone && configuration.MutationGuard != MutationGuardStriped {
-		return fmt.Errorf("SESSION_MUTATION_GUARD must be none or striped")
-	}
-	if configuration.MutationGuardStripes < 1 || configuration.MutationGuardStripes > 65536 {
-		return fmt.Errorf("MUTATION_GUARD_STRIPES must be between 1 and 65536")
 	}
 	if configuration.StartupTimeout <= 0 || configuration.ShutdownTimeout <= 0 {
 		return fmt.Errorf("startup and shutdown timeouts must be positive")

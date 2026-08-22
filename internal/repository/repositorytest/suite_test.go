@@ -10,8 +10,8 @@ func TestCasesExposeTheSharedAdapterContract(t *testing.T) {
 
 	want := []string{
 		"lifecycle snapshots",
-		"callback rollback and isolation",
-		"same key serialization",
+		"snapshot isolation",
+		"atomic mutation rollback",
 		"generic state scoped filters",
 		"pagination and stable cursors",
 		"query result isolation",

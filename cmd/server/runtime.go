@@ -30,11 +30,7 @@ func run(ctx context.Context, configuration appconfig.Config, logger *log.Logger
 	if err != nil {
 		return err
 	}
-	guard, err := mutationGuard(configuration)
-	if err != nil {
-		return errors.Join(err, repo.Close())
-	}
-	application, err := service.New(service.Dependencies{Repository: repo, MutationGuard: guard})
+	application, err := service.New(service.Dependencies{Repository: repo})
 	if err != nil {
 		return errors.Join(err, repo.Close())
 	}
@@ -77,13 +73,6 @@ func run(ctx context.Context, configuration appconfig.Config, logger *log.Logger
 		serverError = nil
 	}
 	return errors.Join(runError, dispatcherError, serverError, repo.Close())
-}
-
-func mutationGuard(configuration appconfig.Config) (service.MutationGuard, error) {
-	if configuration.MutationGuard == appconfig.MutationGuardNone {
-		return service.NoopMutationGuard{}, nil
-	}
-	return service.NewStripedMutationGuard(configuration.MutationGuardStripes)
 }
 
 func shutdownDispatcher(dispatcher *eventstream.Dispatcher, timeout time.Duration) error {
