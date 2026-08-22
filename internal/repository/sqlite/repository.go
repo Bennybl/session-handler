@@ -19,6 +19,8 @@ var schema string
 const storageID = "sqlite"
 
 type Repository struct {
+	// mu only keeps Close from racing an in-flight operation. All operations
+	// hold a read lock, so it does not serialize ingestion or same-key writes.
 	mu     sync.RWMutex
 	db     *sql.DB
 	closed bool
@@ -51,22 +53,37 @@ func Open(ctx context.Context) (*Repository, error) {
 	return &Repository{db: db}, nil
 }
 
-func (r *Repository) Mutate(ctx context.Context, key session.SessionKey, fn repository.MutationFunc) error {
+func (r *Repository) LoadCurrent(ctx context.Context, key session.SessionKey) (session.CurrentSessionSnapshot, error) {
+	if ctx == nil {
+		return session.CurrentSessionSnapshot{}, fmt.Errorf("%w: context is required", session.ErrInvalidInput)
+	}
+	if err := ctx.Err(); err != nil {
+		return session.CurrentSessionSnapshot{}, err
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if r.closed {
+		return session.CurrentSessionSnapshot{}, repository.ErrClosed
+	}
+	return loadCurrent(ctx, r.db, key)
+}
+
+func (r *Repository) ApplyMutation(ctx context.Context, key session.SessionKey, mutation session.Mutation) error {
 	if ctx == nil {
 		return fmt.Errorf("%w: context is required", session.ErrInvalidInput)
 	}
-	if fn == nil {
-		return fmt.Errorf("%w: mutation callback is required", session.ErrInvalidInput)
-	}
 	if err := ctx.Err(); err != nil {
 		return err
+	}
+	if mutation == nil {
+		return invalidMutation("mutation is required")
 	}
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	if r.closed {
 		return repository.ErrClosed
 	}
-	return r.mutate(ctx, key, fn)
+	return r.applyMutation(ctx, key, mutation)
 }
 
 func (r *Repository) Query(ctx context.Context, spec session.QuerySpec) (session.QueryResult, error) {

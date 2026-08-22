@@ -26,8 +26,8 @@ type Case struct {
 func Cases() []Case {
 	return []Case{
 		{Name: "lifecycle snapshots", Run: testLifecycleSnapshots},
-		{Name: "callback rollback and isolation", Run: testCallbackRollbackAndIsolation},
-		{Name: "same key serialization", Run: testSameKeySerialization},
+		{Name: "snapshot isolation", Run: testSnapshotIsolation},
+		{Name: "atomic mutation rollback", Run: testAtomicMutationRollback},
 		{Name: "generic state scoped filters", Run: testGenericStateScopedFilters},
 		{Name: "pagination and stable cursors", Run: testPaginationAndStableCursors},
 		{Name: "query result isolation", Run: testQueryResultIsolation},
@@ -53,9 +53,7 @@ func Run(t *testing.T, factory Factory) {
 	}
 }
 
-// A mutation reports the snapshot it saw, then advances the lifecycle. The
-// repository must supply the state left by every committed event and nothing
-// from rolled-back ones.
+// Loading and applying advance the lifecycle one typed mutation at a time.
 func testLifecycleSnapshots(t *testing.T, factory Factory) {
 	t.Helper()
 	repo, releaseRepo := newRepository(t, factory)
@@ -91,69 +89,43 @@ func testLifecycleSnapshots(t *testing.T, factory Factory) {
 	sessiontest.Login(t, repo, key, sessiontest.SessionID(2), logoutAt.Add(time.Hour), "user")
 }
 
-// A callback that fails must leave storage untouched, and the snapshot it was
-// given must be a copy it cannot write through.
-func testCallbackRollbackAndIsolation(t *testing.T, factory Factory) {
+// Loaded snapshots are detached values that callers cannot use to mutate storage.
+func testSnapshotIsolation(t *testing.T, factory Factory) {
 	t.Helper()
 	repo, releaseRepo := newRepository(t, factory)
 	defer releaseRepo()
 	key := sessiontest.Key("tenant-a", "alice", "192.0.2.10")
 	sessiontest.Login(t, repo, key, sessiontest.SessionID(1), sessiontest.At("10:00"), "user")
 
-	rollback := errors.New("rollback")
-	err := repo.Mutate(context.Background(), key, func(snapshot session.CurrentSessionSnapshot) (session.Mutation, error) {
-		snapshot.Active.States[0].Tags[0] = "corrupted"
-		return nil, rollback
-	})
-	if !errors.Is(err, rollback) {
-		t.Fatalf("Mutate() error = %v, want %v", err, rollback)
-	}
+	loaded := sessiontest.Snapshot(t, repo, key)
+	loaded.Active.States[0].Tags[0] = "corrupted"
 
 	stored := sessiontest.Snapshot(t, repo, key).Active.States[0].Tags
 	if want := []string{"user"}; !reflect.DeepEqual(stored, want) {
-		t.Fatalf("stored tags = %v, want %v; the callback wrote through its snapshot", stored, want)
+		t.Fatalf("stored tags = %v, want %v; LoadCurrent returned shared storage", stored, want)
 	}
 }
 
-// Mutations on one key run one at a time, so same-key commands cannot overwrite
-// each other.
-func testSameKeySerialization(t *testing.T, factory Factory) {
+// A failed multi-statement mutation rolls back the state close, replacement
+// insert, tags, and event identity as one unit.
+func testAtomicMutationRollback(t *testing.T, factory Factory) {
 	t.Helper()
 	repo, releaseRepo := newRepository(t, factory)
 	defer releaseRepo()
 	key := sessiontest.Key("tenant-a", "alice", "192.0.2.10")
-	rollback := errors.New("do not commit")
-	firstEntered, releaseFirst := make(chan struct{}), make(chan struct{})
-	secondStarted, secondEntered := make(chan struct{}), make(chan struct{})
-	results := make(chan error, 2)
-
-	go func() {
-		results <- repo.Mutate(context.Background(), key, func(session.CurrentSessionSnapshot) (session.Mutation, error) {
-			close(firstEntered)
-			<-releaseFirst
-			return nil, rollback
-		})
-	}()
-	sessiontest.Await(t, firstEntered, "the first callback")
-
-	go func() {
-		close(secondStarted)
-		results <- repo.Mutate(context.Background(), key, func(session.CurrentSessionSnapshot) (session.Mutation, error) {
-			close(secondEntered)
-			return nil, rollback
-		})
-	}()
-	sessiontest.Await(t, secondStarted, "the second mutation attempt")
-	if !sessiontest.Blocked(secondEntered) {
-		t.Fatal("the second same-key callback ran before the first mutation finished")
+	loginAt, updateAt := sessiontest.At("10:00"), sessiontest.At("10:30")
+	sessionID := sessiontest.SessionID(1)
+	loginEvent := sessiontest.Login(t, repo, key, sessionID, loginAt, "user")
+	mutation := session.ReplaceState{
+		EventID: sessiontest.EventID(2), SessionID: sessionID, CloseCurrentAt: updateAt,
+		State: session.SessionState{ValidFrom: updateAt, Tags: []string{"duplicate", "duplicate"}},
 	}
-
-	close(releaseFirst)
-	sessiontest.Await(t, secondEntered, "the second callback after release")
-	for range 2 {
-		if err := <-results; !errors.Is(err, rollback) {
-			t.Fatalf("Mutate() error = %v, want %v", err, rollback)
-		}
+	if err := repo.ApplyMutation(context.Background(), key, mutation); err == nil {
+		t.Fatal("ApplyMutation() accepted duplicate tags; want a constraint failure")
+	}
+	after := sessiontest.Snapshot(t, repo, key)
+	if after.LastEventID != loginEvent || after.Active == nil || len(after.Active.States) != 1 || after.Active.States[0].ValidTo != nil {
+		t.Fatalf("snapshot after failed mutation = %+v; want the original open state", after)
 	}
 }
 
@@ -246,25 +218,9 @@ func testEventIDAtomicityAndDeduplication(t *testing.T, factory Factory) {
 	}
 	updateEvent := sessiontest.Update(t, repo, key, updateAt, "admin")
 
-	// A mutation that fails after deciding must not leave its event ID behind.
-	rollback := errors.New("roll back event identity")
-	err := repo.Mutate(context.Background(), key, func(snapshot session.CurrentSessionSnapshot) (session.Mutation, error) {
-		mutation, decisionError := session.DecideUpdate(snapshot, session.UpdateCommand{
-			EventID: sessiontest.NextEventID(), Key: key, Tags: []string{"rolled-back"}, Timestamp: updateAt.Add(time.Minute),
-		})
-		if decisionError != nil {
-			return nil, decisionError
-		}
-		return mutation, rollback
-	})
-	if !errors.Is(err, rollback) {
-		t.Fatalf("rolled-back Mutate() error = %v, want %v", err, rollback)
-	}
-	assertEventIdentity(t, sessiontest.Snapshot(t, repo, key), updateEvent, 2)
-
 	// Replaying the last accepted event succeeds and changes nothing, which is
 	// what makes stream redelivery safe to acknowledge.
-	sessiontest.Mutate(t, repo, key, func(snapshot session.CurrentSessionSnapshot) (session.Mutation, error) {
+	sessiontest.DecideAndApply(t, repo, key, func(snapshot session.CurrentSessionSnapshot) (session.Mutation, error) {
 		return session.DecideUpdate(snapshot, session.UpdateCommand{
 			EventID: updateEvent, Key: key, Tags: []string{"ignored"}, Timestamp: loginAt,
 		})

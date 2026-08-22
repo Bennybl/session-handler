@@ -2,7 +2,6 @@ package sessiontest
 
 import (
 	"context"
-	"errors"
 	"testing"
 	"time"
 
@@ -10,12 +9,19 @@ import (
 	"github.com/Bennybl/session-handler/internal/session"
 )
 
-// Mutate applies decide to key and fails the test when the repository reports
-// an error.
-func Mutate(t *testing.T, repo repository.SessionRepository, key session.SessionKey, decide repository.MutationFunc) {
+// DecideAndApply loads key, runs a domain decision, and persists its mutation.
+func DecideAndApply(t *testing.T, repo repository.SessionRepository, key session.SessionKey, decide func(session.CurrentSessionSnapshot) (session.Mutation, error)) {
 	t.Helper()
-	if err := repo.Mutate(context.Background(), key, decide); err != nil {
-		t.Fatalf("Mutate() error = %v", err)
+	snapshot, err := repo.LoadCurrent(context.Background(), key)
+	if err != nil {
+		t.Fatalf("LoadCurrent() error = %v", err)
+	}
+	mutation, err := decide(snapshot)
+	if err != nil {
+		t.Fatalf("domain decision error = %v", err)
+	}
+	if err := repo.ApplyMutation(context.Background(), key, mutation); err != nil {
+		t.Fatalf("ApplyMutation() error = %v", err)
 	}
 }
 
@@ -23,7 +29,7 @@ func Mutate(t *testing.T, repo repository.SessionRepository, key session.Session
 func Login(t *testing.T, repo repository.SessionRepository, key session.SessionKey, sessionID string, at time.Time, tags ...string) string {
 	t.Helper()
 	eventID := NextEventID()
-	Mutate(t, repo, key, func(snapshot session.CurrentSessionSnapshot) (session.Mutation, error) {
+	DecideAndApply(t, repo, key, func(snapshot session.CurrentSessionSnapshot) (session.Mutation, error) {
 		return session.DecideLogin(snapshot, session.LoginCommand{
 			EventID: eventID, SessionID: sessionID, Key: key, Tags: tags, Timestamp: at,
 		})
@@ -36,7 +42,7 @@ func Login(t *testing.T, repo repository.SessionRepository, key session.SessionK
 func Update(t *testing.T, repo repository.SessionRepository, key session.SessionKey, at time.Time, tags ...string) string {
 	t.Helper()
 	eventID := NextEventID()
-	Mutate(t, repo, key, func(snapshot session.CurrentSessionSnapshot) (session.Mutation, error) {
+	DecideAndApply(t, repo, key, func(snapshot session.CurrentSessionSnapshot) (session.Mutation, error) {
 		return session.DecideUpdate(snapshot, session.UpdateCommand{
 			EventID: eventID, Key: key, Tags: tags, Timestamp: at,
 		})
@@ -48,24 +54,18 @@ func Update(t *testing.T, repo repository.SessionRepository, key session.Session
 func Logout(t *testing.T, repo repository.SessionRepository, key session.SessionKey, at time.Time) string {
 	t.Helper()
 	eventID := NextEventID()
-	Mutate(t, repo, key, func(snapshot session.CurrentSessionSnapshot) (session.Mutation, error) {
+	DecideAndApply(t, repo, key, func(snapshot session.CurrentSessionSnapshot) (session.Mutation, error) {
 		return session.DecideLogout(snapshot, session.LogoutCommand{EventID: eventID, Key: key, Timestamp: at})
 	})
 	return eventID
 }
 
-// Snapshot returns the repository's current snapshot for key. The mutation it
-// runs always rolls back, so the store is left unchanged.
+// Snapshot returns the repository's detached current snapshot for key.
 func Snapshot(t *testing.T, repo repository.SessionRepository, key session.SessionKey) session.CurrentSessionSnapshot {
 	t.Helper()
-	inspected := errors.New("snapshot inspected")
-	var got session.CurrentSessionSnapshot
-	err := repo.Mutate(context.Background(), key, func(snapshot session.CurrentSessionSnapshot) (session.Mutation, error) {
-		got = snapshot
-		return nil, inspected
-	})
-	if !errors.Is(err, inspected) {
-		t.Fatalf("snapshot Mutate() error = %v, want the rollback sentinel", err)
+	got, err := repo.LoadCurrent(context.Background(), key)
+	if err != nil {
+		t.Fatalf("LoadCurrent() error = %v", err)
 	}
 	return got
 }

@@ -14,8 +14,6 @@ Defaults:
 - `PARTITION_QUEUE_CAPACITY=64`
 - `EVENT_RETRY_ATTEMPTS=3`
 - `EVENT_RETRY_DELAY=100ms`
-- `SESSION_MUTATION_GUARD=none`
-- `MUTATION_GUARD_STRIPES=64`
 - `STARTUP_TIMEOUT=10s`
 - `SHUTDOWN_TIMEOUT=10s`
 
@@ -39,5 +37,8 @@ Verification:
 ```powershell
 $env:CGO_ENABLED = '0'
 go test ./...
+go test -race ./...
 go build ./cmd/server
 ```
+
+Partition ownership supplies same-key serialization. The service and repository do not perform application-level locking. SQLite transactions are used only to guarantee atomic persistence and rollback. This runtime assumes every write uses `Dispatcher.Submit` with a canonical `SessionKey`, the partition count stays fixed, one goroutine owns each partition, retries finish before the next event, and only one process writes to the in-memory database.

@@ -9,7 +9,9 @@ POST /v1/events
   -> hash full (tenant, username, canonical IP)
   -> one FIFO worker for that partition
   -> SessionService.ApplyEvent
-  -> repository.Mutate transaction
+  -> repository.LoadCurrent
+  -> domain decides a typed mutation
+  -> repository.ApplyMutation transaction
   -> SQLite :memory:
 
 POST /v1/sessions/query -> generic query preparation -> SQLite query adapter
@@ -17,9 +19,9 @@ POST /v1/sessions/query -> generic query preparation -> SQLite query adapter
 
 ## Concurrency model
 
-There is exactly one long-lived goroutine per configured partition. Every event for the same canonical session key is routed to the same worker, so it cannot overtake an earlier event for that key. A transient failure is retried before that worker receives its next event. Other workers continue independently.
+Partition ownership supplies same-key serialization. The service and repository do not perform application-level locking. SQLite transactions are used only to guarantee atomic persistence and rollback.
 
-The default mutation guard is a no-op because partition ownership supplies same-key ordering. `SESSION_MUTATION_GUARD=striped` enables a fixed striped mutex fallback for same-process producers that do not preserve ownership. This guard cannot coordinate multiple processes.
+The design requires every event write to enter through `Dispatcher.Submit` with its canonical `SessionKey`, the partition count to remain fixed for the process lifetime, and exactly one goroutine to own each partition. A worker completes every retry for an event before taking the next event. Exactly one application process may write to the in-memory database. Other partition workers can continue service processing independently.
 
 SQLite deliberately retains exactly one `database/sql` connection. A bare `:memory:` database belongs to its connection, and the single connection is the embedded SQL serialization point. Partition workers may execute service code concurrently, but SQL transactions serialize at that connection.
 
@@ -37,8 +39,12 @@ LOGIN tenant-a / alice / 2001:0db8::1
   -> FNV-1a full-key hash % partition count
   -> owning worker
   -> DecideLogin
-  -> SQLite transaction: load -> insert session/state/tags -> commit
+  -> LoadCurrent
+  -> DecideLogin
+  -> SQLite transaction: insert session/state/tags -> commit
   -> HTTP 204
 ```
 
 An UPDATE using `2001:db8::1` has the same canonical key and partition, so it cannot overtake the LOGIN.
+
+If multi-process writing is introduced, this ownership assumption breaks. Use database optimistic concurrency or exclusive external partition ownership; do not restore an in-process striped mutex.

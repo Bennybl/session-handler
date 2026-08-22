@@ -73,17 +73,15 @@ type QueryRequest struct {
 }
 
 type Dependencies struct {
-	Repository    repository.SessionRepository
-	MutationGuard MutationGuard
-	Now           func() time.Time
-	NewSessionID  func() (string, error)
+	Repository   repository.SessionRepository
+	Now          func() time.Time
+	NewSessionID func() (string, error)
 }
 
 type SessionService struct {
-	repository    repository.SessionRepository
-	mutationGuard MutationGuard
-	now           func() time.Time
-	newSessionID  func() (string, error)
+	repository   repository.SessionRepository
+	now          func() time.Time
+	newSessionID func() (string, error)
 }
 
 func New(dependencies Dependencies) (*SessionService, error) {
@@ -96,12 +94,8 @@ func New(dependencies Dependencies) (*SessionService, error) {
 	if dependencies.NewSessionID == nil {
 		dependencies.NewSessionID = newUUID
 	}
-	if dependencies.MutationGuard == nil {
-		dependencies.MutationGuard = NoopMutationGuard{}
-	}
 	return &SessionService{
-		repository: dependencies.Repository, mutationGuard: dependencies.MutationGuard,
-		now: dependencies.Now, newSessionID: dependencies.NewSessionID,
+		repository: dependencies.Repository, now: dependencies.Now, newSessionID: dependencies.NewSessionID,
 	}, nil
 }
 
@@ -126,26 +120,31 @@ func (s *SessionService) ApplyEvent(ctx context.Context, event Event) error {
 		sessionID = normalized
 	}
 
-	return s.mutationGuard.Do(ctx, event.Key, func(guardedContext context.Context) error {
-		return s.repository.Mutate(guardedContext, event.Key, func(snapshot session.CurrentSessionSnapshot) (session.Mutation, error) {
-			switch event.Type {
-			case EventLogin:
-				return session.DecideLogin(snapshot, session.LoginCommand{
-					EventID: event.EventID, SessionID: sessionID, Key: event.Key, Tags: event.Tags, Timestamp: event.Timestamp,
-				})
-			case EventUpdate:
-				return session.DecideUpdate(snapshot, session.UpdateCommand{
-					EventID: event.EventID, Key: event.Key, Tags: event.Tags, Timestamp: event.Timestamp,
-				})
-			case EventLogout:
-				return session.DecideLogout(snapshot, session.LogoutCommand{
-					EventID: event.EventID, Key: event.Key, Timestamp: event.Timestamp,
-				})
-			default:
-				return nil, fmt.Errorf("%w: trusted event has unsupported type %q", session.ErrInvalidInput, event.Type)
-			}
+	snapshot, err := s.repository.LoadCurrent(ctx, event.Key)
+	if err != nil {
+		return err
+	}
+	var mutation session.Mutation
+	switch event.Type {
+	case EventLogin:
+		mutation, err = session.DecideLogin(snapshot, session.LoginCommand{
+			EventID: event.EventID, SessionID: sessionID, Key: event.Key, Tags: event.Tags, Timestamp: event.Timestamp,
 		})
-	})
+	case EventUpdate:
+		mutation, err = session.DecideUpdate(snapshot, session.UpdateCommand{
+			EventID: event.EventID, Key: event.Key, Tags: event.Tags, Timestamp: event.Timestamp,
+		})
+	case EventLogout:
+		mutation, err = session.DecideLogout(snapshot, session.LogoutCommand{
+			EventID: event.EventID, Key: event.Key, Timestamp: event.Timestamp,
+		})
+	default:
+		err = fmt.Errorf("%w: trusted event has unsupported type %q", session.ErrInvalidInput, event.Type)
+	}
+	if err != nil {
+		return err
+	}
+	return s.repository.ApplyMutation(ctx, event.Key, mutation)
 }
 
 func (s *SessionService) Query(ctx context.Context, request QueryRequest) (session.QueryResult, error) {
