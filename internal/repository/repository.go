@@ -16,8 +16,8 @@ var (
 // SessionRepository is the storage-neutral boundary for session lifecycle data.
 //
 // The caller must serialize the complete LoadCurrent, domain-decision, and
-// ApplyMutation sequence for each key. The runtime's fixed partition owner is
-// the only application-level mechanism that supplies that guarantee.
+// ApplyMutation sequence for each key. The event Source's broker partition
+// worker is the only application-level mechanism that supplies that guarantee.
 type SessionRepository interface {
 	LoadCurrent(ctx context.Context, key session.SessionKey) (session.CurrentSessionSnapshot, error)
 	ApplyMutation(ctx context.Context, key session.SessionKey, mutation session.Mutation) error
