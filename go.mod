@@ -3,13 +3,13 @@ module github.com/Bennybl/session-handler
 go 1.24.0
 
 require (
+	github.com/google/uuid v1.6.0
 	github.com/twmb/franz-go v1.20.7
 	modernc.org/sqlite v1.39.1
 )
 
 require (
 	github.com/dustin/go-humanize v1.0.1 // indirect
-	github.com/google/uuid v1.6.0 // indirect
 	github.com/klauspost/compress v1.18.4 // indirect
 	github.com/mattn/go-isatty v0.0.20 // indirect
 	github.com/ncruces/go-strftime v0.1.9 // indirect

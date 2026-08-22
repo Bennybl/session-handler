@@ -2,14 +2,13 @@ package service
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"fmt"
 	"strings"
 	"time"
 
 	"github.com/Bennybl/session-handler/internal/repository"
 	"github.com/Bennybl/session-handler/internal/session"
+	"github.com/google/uuid"
 )
 
 type EventType string
@@ -113,11 +112,6 @@ func (s *SessionService) ApplyEvent(ctx context.Context, event Event) error {
 		if err != nil {
 			return fmt.Errorf("create session ID: %w", err)
 		}
-		normalized, normalizeError := normalizeUUID(sessionID)
-		if normalizeError != nil {
-			return normalizeError
-		}
-		sessionID = normalized
 	}
 
 	snapshot, err := s.repository.LoadCurrent(ctx, event.Key)
@@ -172,33 +166,10 @@ func normalizeEventType(value EventType) (EventType, error) {
 	}
 }
 
-func normalizeUUID(value string) (string, error) {
-	compact := strings.ReplaceAll(value, "-", "")
-	if len(value) != 36 || len(compact) != 32 || value[8] != '-' || value[13] != '-' || value[18] != '-' || value[23] != '-' {
-		return "", fmt.Errorf("%w: generated session ID must be a UUID", session.ErrInvalidInput)
-	}
-	if _, err := hex.DecodeString(compact); err != nil {
-		return "", fmt.Errorf("%w: generated session ID must be a UUID", session.ErrInvalidInput)
-	}
-	return strings.ToLower(value), nil
-}
-
 func newUUID() (string, error) {
-	var raw [16]byte
-	if _, err := rand.Read(raw[:]); err != nil {
+	value, err := uuid.NewRandom()
+	if err != nil {
 		return "", err
 	}
-	raw[6] = raw[6]&0x0f | 0x40
-	raw[8] = raw[8]&0x3f | 0x80
-	encoded := make([]byte, 36)
-	hex.Encode(encoded[0:8], raw[0:4])
-	encoded[8] = '-'
-	hex.Encode(encoded[9:13], raw[4:6])
-	encoded[13] = '-'
-	hex.Encode(encoded[14:18], raw[6:8])
-	encoded[18] = '-'
-	hex.Encode(encoded[19:23], raw[8:10])
-	encoded[23] = '-'
-	hex.Encode(encoded[24:36], raw[10:16])
-	return string(encoded), nil
+	return value.String(), nil
 }
