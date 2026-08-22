@@ -6,6 +6,7 @@ import (
 	_ "embed"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Bennybl/session-handler/internal/repository"
@@ -16,7 +17,12 @@ import (
 //go:embed schema.sql
 var schema string
 
-const storageID = "sqlite"
+const (
+	storageID              = "sqlite"
+	maxDatabaseConnections = 16
+)
+
+var databaseSequence atomic.Uint64
 
 type Repository struct {
 	// mu only keeps Close from racing an in-flight operation. All operations
@@ -30,21 +36,22 @@ func Open(ctx context.Context) (*Repository, error) {
 	if ctx == nil {
 		return nil, fmt.Errorf("%w: context is required", session.ErrInvalidInput)
 	}
-	db, err := sql.Open("sqlite", ":memory:")
+	// A named shared in-memory database lets database/sql use multiple
+	// connections without giving each connection an isolated database. The
+	// driver applies connection-local pragmas whenever it opens a connection.
+	dsn := fmt.Sprintf(
+		"file:session-handler-%d?mode=memory&cache=shared&_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)",
+		databaseSequence.Add(1),
+	)
+	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("open SQLite: %w", err)
 	}
-	// A bare in-memory SQLite database belongs to one connection. Retaining
-	// exactly that connection also provides a simple SQL serialization point.
-	db.SetMaxOpenConns(1)
-	db.SetMaxIdleConns(1)
+	db.SetMaxOpenConns(maxDatabaseConnections)
+	db.SetMaxIdleConns(maxDatabaseConnections)
 	if err := db.PingContext(ctx); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("connect to SQLite: %w", err)
-	}
-	if _, err := db.ExecContext(ctx, "PRAGMA foreign_keys = ON"); err != nil {
-		_ = db.Close()
-		return nil, fmt.Errorf("enable SQLite foreign keys: %w", err)
 	}
 	if _, err := db.ExecContext(ctx, schema); err != nil {
 		_ = db.Close()

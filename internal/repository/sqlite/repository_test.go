@@ -2,8 +2,10 @@ package sqlite
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/Bennybl/session-handler/internal/query"
 	"github.com/Bennybl/session-handler/internal/repository"
@@ -11,6 +13,43 @@ import (
 	"github.com/Bennybl/session-handler/internal/session"
 	"github.com/Bennybl/session-handler/internal/sessiontest"
 )
+
+func TestRepositoryUsesConcurrentConnectionsToOneInMemoryDatabase(t *testing.T) {
+	repo, err := Open(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = repo.Close() })
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	first, err := repo.db.Conn(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer first.Close()
+	second, err := repo.db.Conn(ctx)
+	if err != nil {
+		t.Fatalf("open second concurrent SQLite connection: %v", err)
+	}
+	defer second.Close()
+
+	if stats := repo.db.Stats(); stats.OpenConnections < 2 || stats.MaxOpenConnections != maxDatabaseConnections {
+		t.Fatalf("database pool stats = %+v", stats)
+	}
+	for index, connection := range []*sql.Conn{first, second} {
+		var foreignKeys, schemaTables int
+		if err := connection.QueryRowContext(ctx, "PRAGMA foreign_keys").Scan(&foreignKeys); err != nil {
+			t.Fatalf("connection %d foreign_keys: %v", index, err)
+		}
+		if err := connection.QueryRowContext(ctx, `SELECT count(*) FROM sqlite_schema WHERE type = 'table' AND name = 'sessions'`).Scan(&schemaTables); err != nil {
+			t.Fatalf("connection %d schema query: %v", index, err)
+		}
+		if foreignKeys != 1 || schemaTables != 1 {
+			t.Fatalf("connection %d foreign_keys=%d sessions tables=%d", index, foreignKeys, schemaTables)
+		}
+	}
+}
 
 func TestRepositoryContract(t *testing.T) {
 	repositorytest.Run(t, func(t *testing.T) repository.SessionRepository {
