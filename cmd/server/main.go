@@ -25,5 +25,5 @@ func runMain() error {
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	return run(ctx, configuration, defaultRuntimeDependencies())
+	return run(ctx, configuration, log.Default())
 }
