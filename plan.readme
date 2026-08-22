@@ -1,418 +1,44 @@
-# Stream-Driven Dual-Storage Session Handler Architecture
+# Standalone Partitioned Session Handler
 
-## Summary
-
-Implement interchangeable in-memory and PostgreSQL repositories behind one
-`SessionRepository` interface.
+The server is one Go process with one HTTP ingress, a fixed partition dispatcher, and an embedded in-memory SQLite repository.
 
 ```text
-stdin stream -----+
-                  +-> EventConsumer -> SessionService --+
-NATS JetStream ---+                                     |
-                                                        +-> SessionRepository
-HTTP query API --------> QueryService ------------------+        |
-                                                                 +-- memory
-                                                                 +-- PostgreSQL
+POST /v1/events
+  -> strict JSON decode
+  -> service.NewEvent (canonical key, type, event ID, UTC time)
+  -> hash full (tenant, username, canonical IP)
+  -> one FIFO worker for that partition
+  -> SessionService.ApplyEvent
+  -> repository.Mutate transaction
+  -> SQLite :memory:
+
+POST /v1/sessions/query -> generic query preparation -> SQLite query adapter
 ```
 
-- `go run ./cmd/server` defaults to memory storage and an NDJSON stdin event
-  stream, requiring no Docker or database.
-- `docker compose up --build` runs NATS JetStream, migrations, PostgreSQL, and
-  the service using durable stream ingestion and PostgreSQL storage.
-- Both adapters obey the same mutation and query contracts.
-- Events enter only through a stream. HTTP is query-only.
-- Sessions and historical states are stored directly. The repositories do not
-  retain a permanent raw-event log; JetStream retains source messages according
-  to its configured bounded retention policy.
+## Concurrency model
 
-## Identity and Uniqueness
+There is exactly one long-lived goroutine per configured partition. Every event for the same canonical session key is routed to the same worker, so it cannot overtake an earlier event for that key. A transient failure is retried before that worker receives its next event. Other workers continue independently.
 
-The assignment defines a user by `(tenantId, username)`.
+The default mutation guard is a no-op because partition ownership supplies same-key ordering. `SESSION_MUTATION_GUARD=striped` enables a fixed striped mutex fallback for same-process producers that do not preserve ownership. This guard cannot coordinate multiple processes.
 
-- A username must identify only one logical user inside one tenant.
-- The same username may exist in different tenants.
-- No separate `users` table is needed because the assignment provides no user
-  metadata beyond tenant and username.
-- An IP is not unique. Multiple users in one tenant may share an IP, and the same
-  IP may occur across tenants.
-- A live connection is identified by `(tenantId, username, ip)`.
-- At most one active lifecycle may exist for that exact triple.
-- The same triple may have multiple sequential lifecycles after logout/relogin.
-- `sessionId` is globally unique and distinguishes those lifecycles.
+SQLite deliberately retains exactly one `database/sql` connection. A bare `:memory:` database belongs to its connection, and the single connection is the embedded SQL serialization point. Partition workers may execute service code concurrently, but SQL transactions serialize at that connection.
 
-PostgreSQL enforces only active-session uniqueness on the full session key. It
-must not place a unique constraint on username alone, tenant and IP, or IP alone.
-The memory adapter enforces the same invariant during mutation.
+## Data and query behavior
 
-## Domain Model
+Sessions, states, and tags are normalized relational rows. Times are stored as signed UTC Unix nanoseconds. SQLite constraints enforce one active session per full key, one open state per active session, foreign keys, nonblank identity fields, and valid interval bounds.
 
-### Session
+Domain transitions preserve login, update, logout, duplicate, stale-event, tag-set, and half-open `[from,to)` behavior. Query preparation remains storage-neutral and owns filter normalization, fingerprints, evaluated-at snapshots, and cursor validation. SQLite cursors use storage identifier `sqlite` and keyset order `(tenant, username, IP, login time, session ID)` with binary text collation.
 
-A `Session` represents one login-to-logout lifecycle:
-
-- Opaque UUID
-- Tenant ID
-- Username
-- IP address
-- `loginAt`
-- Optional `logoutAt`
-- Last accepted event ID, used internally for stream redelivery deduplication
-- Ordered historical `SessionState` values
-
-### Session state
-
-A `SessionState` contains:
-
-- Normalized tags
-- `validFrom`
-- Optional `validTo`
-
-Lifecycle and state intervals use half-open `[from,to)` semantics. Missing end
-times mean the interval remains active.
-
-Tags use set semantics: values are deduplicated, stable-sorted, and compared
-case-sensitively. An update supplies the complete replacement set.
-
-## Event Processing
-
-Every stream message contains:
+## Example
 
 ```text
-SessionEvent
-  eventId       // UUID, required for idempotency
-  type          // LOGIN, UPDATE, or LOGOUT
-  tenantId
-  username
-  ip
-  tags[]        // LOGIN and UPDATE
-  timestamp
+LOGIN tenant-a / alice / 2001:0db8::1
+  -> canonical key (tenant-a, alice, 2001:db8::1)
+  -> FNV-1a full-key hash % partition count
+  -> owning worker
+  -> DecideLogin
+  -> SQLite transaction: load -> insert session/state/tags -> commit
+  -> HTTP 204
 ```
 
-Commands produce shared domain mutations:
-
-- Login creates a lifecycle and initial state (`StartSession`).
-- Update closes the current state and creates its replacement (`ReplaceState`).
-- Logout closes the current state and lifecycle (`EndSession`).
-
-Rules:
-
-- Login requires no active lifecycle for the exact session key.
-- Update and logout require an active lifecycle.
-- Relogin creates a new lifecycle and UUID.
-- Invalid transitions return `invalid_transition` without changing storage.
-- Events older than the latest accepted timestamp return `stale_event` without
-  changing storage.
-- Events for a key must arrive in non-decreasing timestamp order.
-- Equal-time commands use repository serialization order.
-- Arbitrary late historical correction is unsupported.
-
-## Event Stream Ingestion
-
-Define an `EventSource` boundary so stream transport details stay outside the
-domain and repository layers. Initial adapters are:
-
-- `StdinEventSource`: reads newline-delimited JSON for a zero-dependency local
-  run. EOF stops ingestion but leaves the query server running.
-- `NATSJetStreamEventSource`: consumes subject `sessions.events` through durable
-  consumer `session-handler` with explicit acknowledgements.
-
-The initial JetStream pull consumer fetches one message at a time and uses
-`MaxAckPending=1`. This deliberately favors simple global ordering over
-throughput. A later implementation can partition by canonical `SessionKey` to
-process different keys concurrently without weakening same-key ordering.
-
-Delivery behavior:
-
-1. Decode and validate the stream envelope.
-2. Apply the event through `SessionService` and `SessionRepository.Mutate`.
-3. Atomically store the accepted `eventId` with the session mutation.
-4. Acknowledge only after the repository commits.
-5. Treat a redelivery of the last accepted `eventId` as a successful no-op and
-   acknowledge it.
-6. Use a delayed negative acknowledgement for transient repository failures.
-7. Publish malformed or permanently invalid events to `sessions.events.dlq` and
-   terminate the original only after the dead-letter publish succeeds. If that
-   publish fails, negatively acknowledge the original with a delay.
-
-This provides at-least-once transport with idempotent application. It does not
-make NATS and PostgreSQL one distributed transaction; the stored event ID closes
-the crash window between database commit and stream acknowledgement.
-
-## Repository Mutation Contract
-
-Define the central operation as:
-
-```go
-Mutate(ctx, key, fn)
-```
-
-`SessionRepository.Mutate(ctx, key, fn)` is an atomic per-`SessionKey`
-read-modify-write operation. The repository must:
-
-1. Serialize concurrent mutations for the same key.
-2. Load a consistent `CurrentSessionSnapshot`.
-3. Execute the shared domain transition callback.
-4. Persist the returned typed mutation.
-5. Commit all changes or roll everything back as one unit.
-
-The callback is side-effect-free because an adapter may retry it. It receives the
-latest accepted timestamp and event ID, active lifecycle, and current state, and
-returns `StartSession`, `ReplaceState`, `EndSession`, or a successful
-`DuplicateEvent` no-op when the message repeats the latest accepted event ID.
-
-Each adapter chooses its concurrency mechanism:
-
-- Memory uses a write lock and copy-on-mutate behavior.
-- PostgreSQL uses a transaction-scoped advisory lock derived from the complete
-  session key, then locks any matching session rows. The advisory lock also
-  serializes the first login, when no session row exists yet.
-- A future adapter may use optimistic concurrency, compare-and-swap, and retries.
-
-Repository guarantees:
-
-- Same-key commands cannot overwrite one another.
-- Failed callbacks or persistence operations leave storage unchanged.
-- Queries see consistent snapshots.
-- Mutable values are isolated at repository boundaries.
-- Both adapters produce equivalent observable behavior.
-
-## Generic Query Specification
-
-The query interface accepts a storage-neutral specification:
-
-```text
-QuerySpec
-  filters[]
-    field
-    operator
-    value
-  page
-    limit
-    cursor?
-```
-
-Every filter is composed only of `Field`, `Operator`, and `Value`. Filters combine
-with logical AND. Operators such as `in`, `containsAny`, and `containsAll` express
-OR-like behavior within one filter.
-
-Initial logical fields and operators:
-
-| Field | Operators | Value |
-|---|---|---|
-| `sessionId` | `eq`, `in` | UUID or UUID array |
-| `tenantId` | `eq`, `in` | string or string array |
-| `username` | `eq`, `in` | string or string array |
-| `ip` | `eq`, `in` | IP string or IP array |
-| `tags` | `containsAll`, `containsAny` | string array |
-| `activity` | `at`, `overlaps` | RFC 3339 point or interval object |
-| `loginTime` | `eq`, `gt`, `gte`, `lt`, `lte`, `between` | RFC 3339 value or interval object |
-
-An interval value is an object containing optional `from` and `to`; at least one
-must be present. Bounded intervals use `[from,to)` and require `from < to`.
-
-If no `activity` filter is supplied, the repository applies `activity at now`.
-The service captures that current time once and places it in internal query
-execution context without knowing how the activity field is implemented.
-
-All state-scoped filters must match the same state. For example, an activity
-overlap and `tags containsAll` cannot be satisfied by two different states.
-
-### Declarative field registries
-
-Each repository maintains a declarative registry keyed by logical field and
-operator.
-
-The registry entry owns:
-
-- Supported operator combinations
-- Value decoding and normalization
-- Whether the predicate applies to a session or a state
-- Storage-specific predicate construction
-
-The memory registry maps entries to Go predicate functions. The PostgreSQL
-registry maps entries to static SQL fragment builders and bound parameters.
-
-User-provided field names, operators, and values are never interpolated into SQL.
-Only pre-registered static fragments may contribute SQL syntax; all values use
-parameters. Unknown fields, unsupported operators, and invalid values return
-`invalid_query`.
-
-The service/query orchestration remains unaware of individual filter types. New
-fields are added through registry entries and adapter contract tests rather than
-new service conditionals.
-
-## Pagination
-
-Pagination is over sessions, never individual state rows.
-
-Request:
-
-- Default limit: 50
-- Maximum limit: 200
-- Optional opaque cursor
-
-Response:
-
-```json
-{
-  "sessions": [],
-  "nextCursor": "opaque-value"
-}
-```
-
-`nextCursor` is omitted when no further result exists.
-
-Use keyset pagination with the stable order:
-
-1. Tenant ID
-2. Username
-3. IP
-4. Login time
-5. Session UUID
-
-The cursor is versioned, URL-safe base64 and contains:
-
-- Last returned sort tuple
-- Normalized query fingerprint
-- Effective default activity timestamp
-- Storage-mode identifier
-
-A cursor is rejected if malformed, used with different filters, or used against
-a different storage adapter. Consumers treat it as opaque.
-
-The cursor keeps ordering and default-now semantics stable, but it does not hold
-a database snapshot open between HTTP requests. Concurrent changes may affect
-later pages; snapshot-isolated multi-request pagination is out of scope.
-
-Memory sorts and seeks after the cursor tuple. PostgreSQL uses a keyset `WHERE`
-predicate and requests `limit + 1` rows to determine whether another page exists.
-
-## Query HTTP API
-
-Use a JSON query endpoint because a generic typed specification and cursor are
-awkward to represent safely in URL parameters:
-
-`POST /v1/sessions/query`
-
-Example:
-
-```json
-{
-  "filters": [
-    {"field": "tenantId", "operator": "eq", "value": "T1"},
-    {
-      "field": "activity",
-      "operator": "overlaps",
-      "value": {
-        "from": "2026-08-21T10:00:00Z",
-        "to": "2026-08-21T12:00:00Z"
-      }
-    },
-    {"field": "tags", "operator": "containsAll", "value": ["admin"]}
-  ],
-  "page": {"limit": 50}
-}
-```
-
-The response contains complete matching sessions and all their state history.
-The repository first pages distinct session identities and then loads all states
-for the selected sessions.
-
-This is the only business HTTP endpoint. There is no event-ingestion HTTP API;
-events arrive through the configured `EventSource`.
-
-## In-Memory Repository
-
-- Stores `map[SessionKey][]Session` plus latest timestamps and accepted event IDs.
-- Uses one global `sync.RWMutex`.
-- Mutations hold the write lock.
-- Queries copy a snapshot under the read lock and evaluate the field registry
-  outside the lock.
-- Data is lost at process exit.
-
-## PostgreSQL Repository
-
-### Schema
-
-`sessions` contains UUID, session-key columns, login/logout times, the latest
-accepted event ID for stream deduplication, and a generated `tstzrange` lifecycle.
-It has a partial unique index for one active lifecycle per exact session key,
-B-tree identity/login indexes, and a GiST lifecycle index.
-
-`session_states` contains session UUID, `text[]` tags, valid-from/to times, and a
-generated `tstzrange` activity interval. It has GiST activity, GIN tag, and
-session/state-order indexes.
-
-### Mutation
-
-Every mutation transaction:
-
-1. Acquires a transaction-scoped advisory lock derived from the canonical
-   `(tenantId, username, ip)` tuple.
-2. Loads the latest matching lifecycle and locks matching `sessions` rows using
-   `SELECT ... FOR UPDATE`.
-3. Derives the latest event timestamp and current snapshot from the session and
-   state history.
-4. Executes the shared callback.
-5. Applies the typed mutation.
-6. Commits or rolls back completely.
-
-The advisory lock is required for a key's first login because there is no row to
-lock yet. Hash collisions may serialize unrelated keys but cannot violate
-correctness. PostgreSQL stores only the two domain tables: `sessions` and
-`session_states`; the migration ledger is infrastructure metadata.
-
-### Dynamic queries
-
-The PostgreSQL registry builds parameterized predicates. Session-scoped filters
-apply to `sessions`; state-scoped filters are combined into one correlated
-`EXISTS` over `session_states` so activity and tag requirements target the same
-row. Querying selects one page of distinct session IDs before loading complete
-state histories.
-
-## Runtime and Health
-
-Memory mode defaults:
-
-```text
-SESSION_STORAGE=memory
-EVENT_STREAM_DRIVER=stdin
-HTTP_ADDR=:8080
-```
-
-Durable stream mode requires:
-
-```text
-EVENT_STREAM_DRIVER=nats
-NATS_URL=nats://...
-NATS_STREAM=SESSION_EVENTS
-NATS_SUBJECT=sessions.events
-NATS_CONSUMER=session-handler
-```
-
-PostgreSQL storage additionally requires:
-
-```text
-SESSION_STORAGE=postgres
-DATABASE_URL=postgres://...
-```
-
-Docker Compose starts NATS JetStream and PostgreSQL, runs versioned migrations,
-creates the stream/consumer, and starts the service in NATS/PostgreSQL mode.
-
-- `GET /healthz` reports process liveness.
-- `GET /readyz` reports repository and event-source readiness.
-
-## Assumptions and Tradeoffs
-
-- Memory is the default straight-run mode.
-- Stdin is the default straight-run event source; NATS JetStream is the durable
-  Compose event source.
-- The stores are independent; changing modes does not transfer data.
-- User identity is tenant-scoped; IP addresses are intentionally non-unique.
-- Pagination provides stable keyset traversal, not a cross-request snapshot.
-- The application does not store a permanent raw-event log. Broker retention is
-  bounded operational storage, not the session source of truth.
-- Late historical corrections remain out of scope.
-- History retention, authentication, and distributed ordering remain future work.
-
+An UPDATE using `2001:db8::1` has the same canonical key and partition, so it cannot overtake the LOGIN.

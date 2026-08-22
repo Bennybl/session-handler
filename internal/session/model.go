@@ -38,17 +38,6 @@ func (k SessionKey) User() UserKey {
 	return UserKey{TenantID: k.TenantID, Username: k.Username}
 }
 
-func (k SessionKey) validate() error {
-	normalized, err := NewSessionKey(k.TenantID, k.Username, k.IP)
-	if err != nil {
-		return err
-	}
-	if normalized != k {
-		return fmt.Errorf("%w: session key must contain a canonical IP address", ErrInvalidInput)
-	}
-	return nil
-}
-
 type Session struct {
 	ID          string
 	Key         SessionKey

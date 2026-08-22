@@ -1,6 +1,4 @@
-// Package repositorytest holds the contract every SessionRepository adapter
-// must satisfy, so the in-memory and PostgreSQL stores are held to one
-// definition of correct behavior.
+// Package repositorytest holds the storage-neutral SessionRepository contract.
 package repositorytest
 
 import (

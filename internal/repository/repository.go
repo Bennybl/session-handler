@@ -20,10 +20,9 @@ type MutationFunc func(session.CurrentSessionSnapshot) (session.Mutation, error)
 
 // SessionRepository is the storage-neutral boundary for session lifecycle data.
 //
-// Mutate is an atomic read-modify-write operation scoped to one SessionKey. It
-// serializes same-key mutations, supplies a consistent and isolated snapshot,
-// invokes fn, and commits the returned mutation or rolls back the entire
-// operation. Errors returned by fn are propagated without changing storage.
+// Mutate supplies a consistent and isolated snapshot and atomically commits the
+// mutation returned by fn, or rolls the entire operation back. Same-key ordering
+// is supplied by the current runtime's partition owner.
 type SessionRepository interface {
 	Mutate(ctx context.Context, key session.SessionKey, fn MutationFunc) error
 	Query(ctx context.Context, spec session.QuerySpec) (session.QueryResult, error)

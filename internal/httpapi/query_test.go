@@ -13,7 +13,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Bennybl/session-handler/internal/repository/memory"
+	"github.com/Bennybl/session-handler/internal/repository/sqlite"
 	"github.com/Bennybl/session-handler/internal/service"
 	"github.com/Bennybl/session-handler/internal/session"
 	"github.com/Bennybl/session-handler/internal/sessiontest"
@@ -255,11 +255,14 @@ func newHandler(t *testing.T, query QueryService) http.Handler {
 	return handler
 }
 
-// newMemoryHandler builds the real service and handler over an in-memory store,
+// newMemoryHandler builds the real service and handler over embedded SQLite,
 // applies the seed events, and returns both so a test can keep driving events.
 func newMemoryHandler(t *testing.T, now func() time.Time, events ...service.Event) (*service.SessionService, http.Handler) {
 	t.Helper()
-	repo := memory.New()
+	repo, err := sqlite.Open(context.Background())
+	if err != nil {
+		t.Fatalf("sqlite.Open() error = %v", err)
+	}
 	t.Cleanup(func() { _ = repo.Close() })
 
 	assigned := 0
@@ -276,7 +279,7 @@ func newMemoryHandler(t *testing.T, now func() time.Time, events ...service.Even
 	}
 	for _, event := range events {
 		if err := application.ApplyEvent(context.Background(), event); err != nil {
-			t.Fatalf("seed %s for %s: %v", event.Type, event.Username, err)
+			t.Fatalf("seed %s for %s: %v", event.Type, event.Key.Username, err)
 		}
 	}
 	return application, newHandler(t, application)
@@ -285,14 +288,14 @@ func newMemoryHandler(t *testing.T, now func() time.Time, events ...service.Even
 func login(username, ip string, at time.Time, tags ...string) service.Event {
 	return service.Event{
 		EventID: sessiontest.NextEventID(), Type: service.EventLogin,
-		TenantID: "tenant-a", Username: username, IP: ip, Tags: tags, Timestamp: at,
+		Key: sessiontest.Key("tenant-a", username, ip), Tags: tags, Timestamp: at,
 	}
 }
 
 func logout(username, ip string, at time.Time) service.Event {
 	return service.Event{
 		EventID: sessiontest.NextEventID(), Type: service.EventLogout,
-		TenantID: "tenant-a", Username: username, IP: ip, Timestamp: at,
+		Key: sessiontest.Key("tenant-a", username, ip), Timestamp: at,
 	}
 }
 

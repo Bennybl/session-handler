@@ -23,11 +23,48 @@ const (
 type Event struct {
 	EventID   string
 	Type      EventType
+	Key       session.SessionKey
+	Tags      []string
+	Timestamp time.Time
+}
+
+// EventInput is untrusted event data received from a transport.
+type EventInput struct {
+	EventID   string
+	Type      EventType
 	TenantID  string
 	Username  string
 	IP        string
 	Tags      []string
 	Timestamp time.Time
+}
+
+// NewEvent performs the one-time conversion from transport input to a trusted
+// event. Later layers may rely on its key, identity, type, and timestamp being
+// canonical.
+func NewEvent(input EventInput) (Event, error) {
+	eventType, err := normalizeEventType(input.Type)
+	if err != nil {
+		return Event{}, err
+	}
+	key, err := session.NewSessionKey(input.TenantID, input.Username, input.IP)
+	if err != nil {
+		return Event{}, err
+	}
+	eventID, err := session.NormalizeEventID(input.EventID)
+	if err != nil {
+		return Event{}, err
+	}
+	if input.Timestamp.IsZero() {
+		return Event{}, fmt.Errorf("%w: timestamp is required", session.ErrInvalidInput)
+	}
+	return Event{
+		EventID:   eventID,
+		Type:      eventType,
+		Key:       key,
+		Tags:      append([]string(nil), input.Tags...),
+		Timestamp: input.Timestamp.UTC(),
+	}, nil
 }
 
 type QueryRequest struct {
@@ -36,15 +73,17 @@ type QueryRequest struct {
 }
 
 type Dependencies struct {
-	Repository   repository.SessionRepository
-	Now          func() time.Time
-	NewSessionID func() (string, error)
+	Repository    repository.SessionRepository
+	MutationGuard MutationGuard
+	Now           func() time.Time
+	NewSessionID  func() (string, error)
 }
 
 type SessionService struct {
-	repository   repository.SessionRepository
-	now          func() time.Time
-	newSessionID func() (string, error)
+	repository    repository.SessionRepository
+	mutationGuard MutationGuard
+	now           func() time.Time
+	newSessionID  func() (string, error)
 }
 
 func New(dependencies Dependencies) (*SessionService, error) {
@@ -57,8 +96,12 @@ func New(dependencies Dependencies) (*SessionService, error) {
 	if dependencies.NewSessionID == nil {
 		dependencies.NewSessionID = newUUID
 	}
+	if dependencies.MutationGuard == nil {
+		dependencies.MutationGuard = NoopMutationGuard{}
+	}
 	return &SessionService{
-		repository: dependencies.Repository, now: dependencies.Now, newSessionID: dependencies.NewSessionID,
+		repository: dependencies.Repository, mutationGuard: dependencies.MutationGuard,
+		now: dependencies.Now, newSessionID: dependencies.NewSessionID,
 	}, nil
 }
 
@@ -69,25 +112,9 @@ func (s *SessionService) ApplyEvent(ctx context.Context, event Event) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	eventType, err := normalizeEventType(event.Type)
-	if err != nil {
-		return err
-	}
-	key, err := session.NewSessionKey(event.TenantID, event.Username, event.IP)
-	if err != nil {
-		return err
-	}
-	eventID, err := session.NormalizeEventID(event.EventID)
-	if err != nil {
-		return err
-	}
-	if event.Timestamp.IsZero() {
-		return fmt.Errorf("%w: timestamp is required", session.ErrInvalidInput)
-	}
-	timestamp := event.Timestamp.UTC()
-
 	var sessionID string
-	if eventType == EventLogin {
+	var err error
+	if event.Type == EventLogin {
 		sessionID, err = s.newSessionID()
 		if err != nil {
 			return fmt.Errorf("create session ID: %w", err)
@@ -99,23 +126,25 @@ func (s *SessionService) ApplyEvent(ctx context.Context, event Event) error {
 		sessionID = normalized
 	}
 
-	return s.repository.Mutate(ctx, key, func(snapshot session.CurrentSessionSnapshot) (session.Mutation, error) {
-		switch eventType {
-		case EventLogin:
-			return session.DecideLogin(snapshot, session.LoginCommand{
-				EventID: eventID, SessionID: sessionID, Key: key, Tags: event.Tags, Timestamp: timestamp,
-			})
-		case EventUpdate:
-			return session.DecideUpdate(snapshot, session.UpdateCommand{
-				EventID: eventID, Key: key, Tags: event.Tags, Timestamp: timestamp,
-			})
-		case EventLogout:
-			return session.DecideLogout(snapshot, session.LogoutCommand{
-				EventID: eventID, Key: key, Timestamp: timestamp,
-			})
-		default:
-			panic("normalized event type is unsupported")
-		}
+	return s.mutationGuard.Do(ctx, event.Key, func(guardedContext context.Context) error {
+		return s.repository.Mutate(guardedContext, event.Key, func(snapshot session.CurrentSessionSnapshot) (session.Mutation, error) {
+			switch event.Type {
+			case EventLogin:
+				return session.DecideLogin(snapshot, session.LoginCommand{
+					EventID: event.EventID, SessionID: sessionID, Key: event.Key, Tags: event.Tags, Timestamp: event.Timestamp,
+				})
+			case EventUpdate:
+				return session.DecideUpdate(snapshot, session.UpdateCommand{
+					EventID: event.EventID, Key: event.Key, Tags: event.Tags, Timestamp: event.Timestamp,
+				})
+			case EventLogout:
+				return session.DecideLogout(snapshot, session.LogoutCommand{
+					EventID: event.EventID, Key: event.Key, Timestamp: event.Timestamp,
+				})
+			default:
+				return nil, fmt.Errorf("%w: trusted event has unsupported type %q", session.ErrInvalidInput, event.Type)
+			}
+		})
 	})
 }
 
@@ -124,9 +153,6 @@ func (s *SessionService) Query(ctx context.Context, request QueryRequest) (sessi
 		return session.QueryResult{}, fmt.Errorf("%w: context is required", session.ErrInvalidInput)
 	}
 	if err := ctx.Err(); err != nil {
-		return session.QueryResult{}, err
-	}
-	if err := validateQueryStructure(request); err != nil {
 		return session.QueryResult{}, err
 	}
 	spec := session.QuerySpec{
@@ -145,24 +171,6 @@ func normalizeEventType(value EventType) (EventType, error) {
 	default:
 		return "", fmt.Errorf("%w: unsupported event type %q", session.ErrInvalidInput, value)
 	}
-}
-
-func validateQueryStructure(request QueryRequest) error {
-	if request.Page.Limit < 0 {
-		return fmt.Errorf("%w: page limit cannot be negative", repository.ErrInvalidQuery)
-	}
-	for _, filter := range request.Filters {
-		if strings.TrimSpace(string(filter.Field)) == "" {
-			return fmt.Errorf("%w: filter field is required", repository.ErrInvalidQuery)
-		}
-		if strings.TrimSpace(string(filter.Operator)) == "" {
-			return fmt.Errorf("%w: filter operator is required", repository.ErrInvalidQuery)
-		}
-		if filter.Value == nil {
-			return fmt.Errorf("%w: filter value is required", repository.ErrInvalidQuery)
-		}
-	}
-	return nil
 }
 
 func normalizeUUID(value string) (string, error) {

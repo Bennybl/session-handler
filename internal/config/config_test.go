@@ -5,79 +5,32 @@ import (
 	"time"
 )
 
-// With nothing configured the service runs the zero-dependency mode: an
-// in-memory store fed by stdin. Explicit settings override every default, and
-// driver names are trimmed and case-insensitive.
-func TestLoadResolvesDefaultAndExplicitConfiguration(t *testing.T) {
-	t.Parallel()
-
-	got, err := FromLookup(mapLookup(nil))
+func TestDefaultsAndOverrides(t *testing.T) {
+	defaults, err := FromLookup(mapLookup(nil))
 	if err != nil {
-		t.Fatalf("FromLookup() error = %v", err)
+		t.Fatal(err)
 	}
-
-	want := Config{
-		StorageDriver: StorageMemory, EventStreamDriver: EventStreamStdin, HTTPAddr: ":8080",
-		NATSStream: "SESSION_EVENTS", NATSSubject: "sessions.events", NATSConsumer: "session-handler",
-		NATSDeadLetterSubject: "sessions.events.dlq",
-		StartupTimeout:        10 * time.Second, ShutdownTimeout: 10 * time.Second,
+	want := Config{HTTPAddr: ":8080", PartitionCount: 16, PartitionQueueCapacity: 64, EventRetryAttempts: 3, EventRetryDelay: 100 * time.Millisecond, MutationGuard: MutationGuardNone, MutationGuardStripes: 64, StartupTimeout: 10 * time.Second, ShutdownTimeout: 10 * time.Second}
+	if defaults != want {
+		t.Fatalf("defaults = %+v, want %+v", defaults, want)
 	}
-	if got != want {
-		t.Errorf("default configuration = %+v, want %+v", got, want)
-	}
-
-	got, err = FromLookup(mapLookup(map[string]string{
-		"SESSION_STORAGE": " POSTGRES ", "DATABASE_URL": "postgres://database/session",
-		"EVENT_STREAM_DRIVER": " NATS ", "NATS_URL": "nats://broker:4222",
-		"NATS_STREAM": "CUSTOM_EVENTS", "NATS_SUBJECT": "custom.events",
-		"NATS_CONSUMER": "custom-handler", "NATS_DLQ_SUBJECT": "custom.events.dlq",
-		"HTTP_ADDR": "127.0.0.1:9090", "STARTUP_TIMEOUT": "3s", "SHUTDOWN_TIMEOUT": "4s",
-	}))
+	override, err := FromLookup(mapLookup(map[string]string{"HTTP_ADDR": "127.0.0.1:9090", "PARTITION_COUNT": "4", "PARTITION_QUEUE_CAPACITY": "8", "EVENT_RETRY_ATTEMPTS": "5", "EVENT_RETRY_DELAY": "2ms", "SESSION_MUTATION_GUARD": "STRIPED", "MUTATION_GUARD_STRIPES": "7", "STARTUP_TIMEOUT": "2s", "SHUTDOWN_TIMEOUT": "3s"}))
 	if err != nil {
-		t.Fatalf("FromLookup() error = %v", err)
+		t.Fatal(err)
 	}
-
-	want = Config{
-		StorageDriver: StoragePostgres, DatabaseURL: "postgres://database/session",
-		EventStreamDriver: EventStreamNATS, NATSURL: "nats://broker:4222",
-		NATSStream: "CUSTOM_EVENTS", NATSSubject: "custom.events", NATSConsumer: "custom-handler",
-		NATSDeadLetterSubject: "custom.events.dlq", HTTPAddr: "127.0.0.1:9090",
-		StartupTimeout: 3 * time.Second, ShutdownTimeout: 4 * time.Second,
-	}
-	if got != want {
-		t.Errorf("explicit configuration = %+v, want %+v", got, want)
+	if override.PartitionCount != 4 || override.MutationGuard != MutationGuardStriped || override.MutationGuardStripes != 7 {
+		t.Fatalf("override = %+v", override)
 	}
 }
 
-func TestLoadRejectsInvalidDriversMissingURLsAndTimeouts(t *testing.T) {
-	t.Parallel()
-
-	tests := []struct {
-		name   string
-		values map[string]string
-	}{
-		{name: "unknown storage driver", values: map[string]string{"SESSION_STORAGE": "redis"}},
-		{name: "postgres without a URL", values: map[string]string{"SESSION_STORAGE": "postgres"}},
-		{name: "unknown event stream driver", values: map[string]string{"EVENT_STREAM_DRIVER": "kafka"}},
-		{name: "NATS without a URL", values: map[string]string{"EVENT_STREAM_DRIVER": "nats"}},
-		{name: "unparsable startup timeout", values: map[string]string{"STARTUP_TIMEOUT": "soon"}},
-		{name: "zero shutdown timeout", values: map[string]string{"SHUTDOWN_TIMEOUT": "0s"}},
-		{name: "dead letters on the event subject", values: map[string]string{
-			"EVENT_STREAM_DRIVER": "nats", "NATS_URL": "nats://broker:4222",
-			"NATS_SUBJECT": "events", "NATS_DLQ_SUBJECT": "events",
-		}},
-	}
-
-	for _, test := range tests {
-		if _, err := FromLookup(mapLookup(test.values)); err == nil {
-			t.Errorf("%s: FromLookup() error = nil, want a configuration error", test.name)
+func TestInvalidConfiguration(t *testing.T) {
+	for key, value := range map[string]string{"PARTITION_COUNT": "0", "PARTITION_QUEUE_CAPACITY": "0", "EVENT_RETRY_ATTEMPTS": "0", "EVENT_RETRY_DELAY": "0s", "SESSION_MUTATION_GUARD": "distributed", "MUTATION_GUARD_STRIPES": "0", "STARTUP_TIMEOUT": "0s"} {
+		if _, err := FromLookup(mapLookup(map[string]string{key: value})); err == nil {
+			t.Errorf("%s=%q accepted", key, value)
 		}
 	}
 }
 
 func mapLookup(values map[string]string) LookupEnv {
-	return func(key string) (string, bool) {
-		value, exists := values[key]
-		return value, exists
-	}
+	return func(key string) (string, bool) { value, exists := values[key]; return value, exists }
 }
