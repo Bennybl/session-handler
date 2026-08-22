@@ -1,27 +1,34 @@
 # Run and exercise the server
 
-Requirements: Go 1.24 or newer. Docker, CGO, PostgreSQL, and NATS are not required.
-
-```powershell
-$env:CGO_ENABLED = '0'
-go run ./cmd/server
-```
+Requirements: Go 1.24 or newer and a reachable Kafka cluster. Docker, CGO, and PostgreSQL are not required.
 
 Defaults:
 
 - `HTTP_ADDR=:8080`
-- `PARTITION_COUNT=16`
-- `PARTITION_QUEUE_CAPACITY=64`
 - `EVENT_RETRY_ATTEMPTS=3`
 - `EVENT_RETRY_DELAY=100ms`
+- `KAFKA_BROKERS=localhost:9092`
+- `KAFKA_TOPIC=session-events`
+- `KAFKA_CONSUMER_GROUP=session-handler`
+- `KAFKA_CLIENT_ID=session-handler`
+- `KAFKA_MAX_POLL_RECORDS=128`
 - `STARTUP_TIMEOUT=10s`
 - `SHUTDOWN_TIMEOUT=10s`
 
-Submit a login:
+Configure Kafka and start the server:
 
 ```powershell
-$body = '{"eventId":"e0000000-0000-4000-8000-000000000001","type":"LOGIN","tenantId":"tenant-a","username":"alice","ip":"2001:0db8::1","tags":["user"],"timestamp":"2026-08-21T10:00:00Z"}'
-Invoke-WebRequest -Method Post -Uri http://localhost:8080/v1/events -ContentType application/json -Body $body
+$env:CGO_ENABLED = '0'
+$env:KAFKA_BROKERS = 'localhost:9092'
+$env:KAFKA_TOPIC = 'session-events'
+$env:KAFKA_CONSUMER_GROUP = 'session-handler'
+go run ./cmd/server
+```
+
+Publish a login event to Kafka using your preferred Kafka producer:
+
+```json
+{"eventId":"e0000000-0000-4000-8000-000000000001","type":"LOGIN","tenantId":"tenant-a","username":"alice","ip":"2001:0db8::1","tags":["user"],"timestamp":"2026-08-21T10:00:00Z"}
 ```
 
 Query active sessions:
@@ -41,4 +48,6 @@ go test -race ./...
 go build ./cmd/server
 ```
 
-Partition ownership supplies same-key serialization. The service and repository do not perform application-level locking. SQLite transactions are used only to guarantee atomic persistence and rollback. This runtime assumes every write uses `Dispatcher.Submit` with a canonical `SessionKey`, the partition count stays fixed, one goroutine owns each partition, retries finish before the next event, and only one process writes to the in-memory database.
+`POST /v1/events` does not exist. Publish records to the configured topic and use a stable record key derived from the complete canonical session key (tenant ID, username, and canonical IP). Kafka batches are committed only after every partition worker finishes its records successfully.
+
+Kafka partition ownership supplies same-key serialization. The service and repository do not perform application-level locking, and there is no application dispatcher. SQLite transactions are used only to guarantee atomic persistence and rollback. This runtime assumes every write enters through `eventstream.Source`, producers key records from the canonical `SessionKey`, the Kafka topic partition count stays fixed, one worker owns each assigned partition, retries finish before that partition's next event, and only one process writes to the in-memory database.

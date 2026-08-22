@@ -1,13 +1,13 @@
-# Standalone Partitioned Session Handler
+# Standalone Kafka Session Handler
 
-The server is one Go process with one HTTP ingress, a fixed partition dispatcher, and an embedded in-memory SQLite repository.
+The server is one Go process with Kafka event ingress, an HTTP query/operations surface, and an embedded in-memory SQLite repository. Kafka partition ownership is the only application-level concurrency mechanism for writes.
 
 ```text
-POST /v1/events
+Kafka consumer-group record
+  -> Kafka partition worker (records processed sequentially)
   -> strict JSON decode
   -> service.NewEvent (canonical key, type, event ID, UTC time)
-  -> hash full (tenant, username, canonical IP)
-  -> one FIFO worker for that partition
+  -> retry to completion before the next record in that partition
   -> SessionService.ApplyEvent
   -> repository.LoadCurrent
   -> domain decides a typed mutation
@@ -17,11 +17,15 @@ POST /v1/events
 POST /v1/sessions/query -> generic query preparation -> SQLite query adapter
 ```
 
+`eventstream.Source` is the broker-neutral boundary. A source owns transport partitioning, sequential processing inside each partition, concurrent processing across partitions, and acknowledgment after successful handling. Kafka polling, consumer-group membership, partition workers, and offset commits remain inside `internal/eventstream/kafka`. Another broker can replace Kafka through the composition root by implementing that contract. There is no HTTP event-ingestion endpoint and no application dispatcher.
+
+Kafka processing is at-least-once. The adapter disables auto-commit, polls a bounded batch, processes each partition sequentially while allowing different partitions to run concurrently, and commits the batch only after every record succeeds. Malformed or permanently rejected domain events are dead-letter logged and treated as successfully handled. Transient processing or commit failures stop the source with the batch uncommitted, allowing redelivery after restart. Domain duplicate-event handling makes that redelivery safe.
+
 ## Concurrency model
 
 Partition ownership supplies same-key serialization. The service and repository do not perform application-level locking. SQLite transactions are used only to guarantee atomic persistence and rollback.
 
-The design requires every event write to enter through `Dispatcher.Submit` with its canonical `SessionKey`, the partition count to remain fixed for the process lifetime, and exactly one goroutine to own each partition. A worker completes every retry for an event before taking the next event. Exactly one application process may write to the in-memory database. Other partition workers can continue service processing independently.
+The design requires every event write to enter through the configured `eventstream.Source`. Kafka producers must derive a stable record key from the complete canonical `SessionKey` (tenant ID, username, and canonical IP), and the Kafka topic's partition count must not change while the process runs. Exactly one worker processes each assigned partition, and it completes every retry for one event before taking the next event in that partition. Exactly one application process may write to the in-memory database. Workers for different Kafka partitions can execute service processing concurrently.
 
 SQLite deliberately retains exactly one `database/sql` connection. A bare `:memory:` database belongs to its connection, and the single connection is the embedded SQL serialization point. Partition workers may execute service code concurrently, but SQL transactions serialize at that connection.
 
@@ -36,15 +40,15 @@ Domain transitions preserve login, update, logout, duplicate, stale-event, tag-s
 ```text
 LOGIN tenant-a / alice / 2001:0db8::1
   -> canonical key (tenant-a, alice, 2001:db8::1)
-  -> FNV-1a full-key hash % partition count
-  -> owning worker
-  -> DecideLogin
+  -> producer's stable Kafka key for the complete canonical key
+  -> Kafka-selected partition
+  -> that partition's sequential consumer worker
   -> LoadCurrent
   -> DecideLogin
   -> SQLite transaction: insert session/state/tags -> commit
-  -> HTTP 204
+  -> Kafka offset commit
 ```
 
-An UPDATE using `2001:db8::1` has the same canonical key and partition, so it cannot overtake the LOGIN.
+An UPDATE using `2001:db8::1` must be produced with the same Kafka key. Kafka then assigns it to the same partition, where sequential consumption prevents it from overtaking the LOGIN.
 
 If multi-process writing is introduced, this ownership assumption breaks. Use database optimistic concurrency or exclusive external partition ownership; do not restore an in-process striped mutex.
