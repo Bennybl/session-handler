@@ -1,292 +1,229 @@
-package session
+package session_test
 
 import (
+	"encoding/json"
 	"errors"
 	"reflect"
 	"testing"
 	"time"
+
+	"github.com/Bennybl/session-handler/internal/session"
+	"github.com/Bennybl/session-handler/internal/sessiontest"
 )
 
-func TestSessionIdentityAndKeyUniqueness(t *testing.T) {
+// A user is a tenant and username; an IP never identifies anyone on its own.
+// Keys are validated and canonicalized, and tags are a set.
+func TestSessionKeyIdentityValidationAndTags(t *testing.T) {
 	t.Parallel()
 
-	aliceIP1, err := NewSessionKey("tenant-a", "alice", "192.0.2.10")
-	if err != nil {
-		t.Fatalf("NewSessionKey() error = %v", err)
+	alice := sessiontest.Key("tenant-a", "alice", "192.0.2.10")
+	aliceOtherIP := sessiontest.Key("tenant-a", "alice", "192.0.2.11")
+	bobSameIP := sessiontest.Key("tenant-a", "bob", "192.0.2.10")
+	aliceOtherTenant := sessiontest.Key("tenant-b", "alice", "192.0.2.10")
+
+	if alice.User() != aliceOtherIP.User() {
+		t.Error("one tenant and username must identify one user across IPs")
 	}
-	aliceIP2, err := NewSessionKey("tenant-a", "alice", "192.0.2.11")
-	if err != nil {
-		t.Fatalf("NewSessionKey() error = %v", err)
+	if alice == aliceOtherIP {
+		t.Error("different IPs must produce different session keys")
 	}
-	bobSameIP, err := NewSessionKey("tenant-a", "bob", "192.0.2.10")
-	if err != nil {
-		t.Fatalf("NewSessionKey() error = %v", err)
+	if alice == bobSameIP {
+		t.Error("an IP must not identify a session on its own")
 	}
-	aliceOtherTenant, err := NewSessionKey("tenant-b", "alice", "192.0.2.10")
-	if err != nil {
-		t.Fatalf("NewSessionKey() error = %v", err)
+	if alice.User() == aliceOtherTenant.User() {
+		t.Error("one username in different tenants must identify different users")
 	}
 
-	if aliceIP1.User() != aliceIP2.User() {
-		t.Fatal("the same tenant and username must identify the same user")
-	}
-	if aliceIP1 == aliceIP2 {
-		t.Fatal("different IPs must produce different session keys")
-	}
-	if aliceIP1 == bobSameIP {
-		t.Fatal("an IP must not uniquely identify a user or session")
-	}
-	if aliceIP1.User() == aliceOtherTenant.User() {
-		t.Fatal("the same username in different tenants must identify different users")
-	}
-}
-
-func TestNewSessionKeyValidatesAndCanonicalizesIP(t *testing.T) {
-	t.Parallel()
-
-	key, err := NewSessionKey("tenant-a", "alice", "2001:0db8:0:0:0:0:0:1")
+	// An expanded IPv6 address is stored in its canonical short form.
+	canonical, err := session.NewSessionKey("tenant-a", "alice", "2001:0db8:0:0:0:0:0:1")
 	if err != nil {
 		t.Fatalf("NewSessionKey() error = %v", err)
 	}
-	if key.IP != "2001:db8::1" {
-		t.Fatalf("IP = %q, want canonical IPv6", key.IP)
+	if canonical.IP != "2001:db8::1" {
+		t.Errorf("IP = %q, want canonical 2001:db8::1", canonical.IP)
 	}
 
-	tests := []struct {
-		name     string
-		tenantID string
-		username string
-		ip       string
-	}{
+	invalidKeys := []struct{ name, tenantID, username, ip string }{
 		{name: "empty tenant", username: "alice", ip: "192.0.2.1"},
 		{name: "empty username", tenantID: "tenant-a", ip: "192.0.2.1"},
 		{name: "invalid IP", tenantID: "tenant-a", username: "alice", ip: "not-an-ip"},
 	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-			if _, err := NewSessionKey(tt.tenantID, tt.username, tt.ip); !errors.Is(err, ErrInvalidInput) {
-				t.Fatalf("error = %v, want ErrInvalidInput", err)
-			}
-		})
+	for _, test := range invalidKeys {
+		if _, err := session.NewSessionKey(test.tenantID, test.username, test.ip); !errors.Is(err, session.ErrInvalidInput) {
+			t.Errorf("%s: NewSessionKey() error = %v, want ErrInvalidInput", test.name, err)
+		}
 	}
-}
 
-func TestNormalizeTagsUsesSetSemantics(t *testing.T) {
-	t.Parallel()
-
-	got, err := NormalizeTags([]string{"user", "admin", "user"})
+	tags, err := session.NormalizeTags([]string{"user", "admin", "user"})
 	if err != nil {
 		t.Fatalf("NormalizeTags() error = %v", err)
 	}
-	want := []string{"admin", "user"}
-	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("NormalizeTags() = %v, want %v", got, want)
+	if want := []string{"admin", "user"}; !reflect.DeepEqual(tags, want) {
+		t.Errorf("NormalizeTags() = %v, want deduplicated and sorted %v", tags, want)
 	}
-
-	if _, err := NormalizeTags([]string{"valid", ""}); !errors.Is(err, ErrInvalidInput) {
-		t.Fatalf("empty tag error = %v, want ErrInvalidInput", err)
+	if _, err := session.NormalizeTags([]string{"valid", ""}); !errors.Is(err, session.ErrInvalidInput) {
+		t.Errorf("empty tag error = %v, want ErrInvalidInput", err)
 	}
 }
 
+// Login opens a lifecycle, update replaces the current state, logout closes
+// both, and a later login opens a distinct lifecycle.
 func TestDecideLifecycle(t *testing.T) {
 	t.Parallel()
 
-	key := mustSessionKey(t, "tenant-a", "alice", "192.0.2.10")
-	loginAt := mustTime(t, "2026-08-21T10:00:00Z")
-	updateAt := mustTime(t, "2026-08-21T10:30:00Z")
-	logoutAt := mustTime(t, "2026-08-21T12:00:00Z")
+	key := sessiontest.Key("tenant-a", "alice", "192.0.2.10")
+	loginAt, updateAt, logoutAt := sessiontest.At("10:00"), sessiontest.At("10:30"), sessiontest.At("12:00")
+	sessionID := sessiontest.SessionID(1)
+	loginEvent, updateEvent := sessiontest.EventID(1), sessiontest.EventID(2)
+	logoutEvent, reloginEvent := sessiontest.EventID(3), sessiontest.EventID(4)
 
-	login, err := DecideLogin(CurrentSessionSnapshot{}, LoginCommand{
-		EventID:   eventIDLower,
-		SessionID: "session-1",
-		Key:       key,
-		Tags:      []string{"user"},
-		Timestamp: loginAt,
+	login, err := session.DecideLogin(session.CurrentSessionSnapshot{}, session.LoginCommand{
+		EventID: loginEvent, SessionID: sessionID, Key: key, Tags: []string{"user"}, Timestamp: loginAt,
 	})
-	if err != nil {
-		t.Fatalf("login Decide() error = %v", err)
+	started := decided[session.StartSession](t, login, err)
+	if started.Session.ID != sessionID {
+		t.Errorf("started session ID = %q, want %q", started.Session.ID, sessionID)
 	}
-	started, ok := login.(StartSession)
-	if !ok {
-		t.Fatalf("login mutation = %T, want StartSession", login)
-	}
-	if started.Session.ID != "session-1" || !started.Session.LoginAt.Equal(loginAt) {
-		t.Fatalf("started session = %+v", started.Session)
+	if !started.Session.LoginAt.Equal(loginAt) {
+		t.Errorf("LoginAt = %v, want %v", started.Session.LoginAt, loginAt)
 	}
 	if len(started.Session.States) != 1 || !started.Session.States[0].ValidFrom.Equal(loginAt) {
-		t.Fatalf("initial states = %+v", started.Session.States)
+		t.Errorf("initial states = %+v, want one state valid from %v", started.Session.States, loginAt)
 	}
 
-	loginSnapshot := CurrentSessionSnapshot{LastEventAt: timePointer(loginAt), LastEventID: eventIDLower, Active: sessionPointer(started.Session)}
-	update, err := DecideUpdate(loginSnapshot, UpdateCommand{
-		EventID:   eventID2,
-		Key:       key,
-		Tags:      []string{"admin", "user"},
-		Timestamp: updateAt,
+	afterLogin := session.CurrentSessionSnapshot{
+		LastEventAt: sessiontest.Ptr(loginAt), LastEventID: loginEvent, Active: &started.Session,
+	}
+	update, err := session.DecideUpdate(afterLogin, session.UpdateCommand{
+		EventID: updateEvent, Key: key, Tags: []string{"admin", "user"}, Timestamp: updateAt,
 	})
-	if err != nil {
-		t.Fatalf("update Decide() error = %v", err)
+	replaced := decided[session.ReplaceState](t, update, err)
+	if replaced.SessionID != sessionID || replaced.EventID != updateEvent {
+		t.Errorf("replacement identity = session %q event %q, want %q and %q", replaced.SessionID, replaced.EventID, sessionID, updateEvent)
 	}
-	replaced, ok := update.(ReplaceState)
-	if !ok {
-		t.Fatalf("update mutation = %T, want ReplaceState", update)
+	if !replaced.CloseCurrentAt.Equal(updateAt) {
+		t.Errorf("CloseCurrentAt = %v, want %v", replaced.CloseCurrentAt, updateAt)
 	}
-	if replaced.EventID != eventID2 || replaced.SessionID != "session-1" || !replaced.CloseCurrentAt.Equal(updateAt) {
-		t.Fatalf("replace mutation = %+v", replaced)
-	}
-	if !reflect.DeepEqual(replaced.State.Tags, []string{"admin", "user"}) {
-		t.Fatalf("replacement tags = %v", replaced.State.Tags)
+	if want := []string{"admin", "user"}; !reflect.DeepEqual(replaced.State.Tags, want) {
+		t.Errorf("replacement tags = %v, want %v", replaced.State.Tags, want)
 	}
 
-	activeAfterUpdate := started.Session
-	activeAfterUpdate.LastEventID = eventID2
-	activeAfterUpdate.States[0].ValidTo = timePointer(updateAt)
-	activeAfterUpdate.States = append(activeAfterUpdate.States, replaced.State)
-	updateSnapshot := CurrentSessionSnapshot{LastEventAt: timePointer(updateAt), LastEventID: eventID2, Active: &activeAfterUpdate}
-	logout, err := DecideLogout(updateSnapshot, LogoutCommand{
-		EventID:   eventID3,
-		Key:       key,
-		Timestamp: logoutAt,
+	active := started.Session
+	active.LastEventID = updateEvent
+	active.States = []session.SessionState{
+		{Tags: []string{"user"}, ValidFrom: loginAt, ValidTo: sessiontest.Ptr(updateAt)},
+		replaced.State,
+	}
+	afterUpdate := session.CurrentSessionSnapshot{
+		LastEventAt: sessiontest.Ptr(updateAt), LastEventID: updateEvent, Active: &active,
+	}
+	logout, err := session.DecideLogout(afterUpdate, session.LogoutCommand{
+		EventID: logoutEvent, Key: key, Timestamp: logoutAt,
 	})
-	if err != nil {
-		t.Fatalf("logout Decide() error = %v", err)
+	ended := decided[session.EndSession](t, logout, err)
+	if ended.SessionID != sessionID || ended.EventID != logoutEvent {
+		t.Errorf("end identity = session %q event %q, want %q and %q", ended.SessionID, ended.EventID, sessionID, logoutEvent)
 	}
-	ended, ok := logout.(EndSession)
-	if !ok {
-		t.Fatalf("logout mutation = %T, want EndSession", logout)
-	}
-	if ended.EventID != eventID3 || ended.SessionID != "session-1" || !ended.LogoutAt.Equal(logoutAt) || !ended.CloseCurrentAt.Equal(logoutAt) {
-		t.Fatalf("end mutation = %+v", ended)
+	if !ended.LogoutAt.Equal(logoutAt) || !ended.CloseCurrentAt.Equal(logoutAt) {
+		t.Errorf("end times = logout %v, close %v, want both %v", ended.LogoutAt, ended.CloseCurrentAt, logoutAt)
 	}
 
-	completed := activeAfterUpdate
-	completed.States[1].ValidTo = timePointer(logoutAt)
-	completed.LogoutAt = timePointer(logoutAt)
-	relogin, err := DecideLogin(CurrentSessionSnapshot{LastEventAt: timePointer(logoutAt), LastEventID: eventID3}, LoginCommand{
-		EventID:   eventID4,
-		SessionID: "session-2",
-		Key:       key,
-		Tags:      []string{"user"},
-		Timestamp: logoutAt.Add(time.Hour),
+	afterLogout := session.CurrentSessionSnapshot{LastEventAt: sessiontest.Ptr(logoutAt), LastEventID: logoutEvent}
+	relogin, err := session.DecideLogin(afterLogout, session.LoginCommand{
+		EventID: reloginEvent, SessionID: sessiontest.SessionID(2), Key: key,
+		Tags: []string{"user"}, Timestamp: logoutAt.Add(time.Hour),
 	})
-	if err != nil {
-		t.Fatalf("relogin Decide() error = %v", err)
-	}
-	restarted := relogin.(StartSession)
-	if restarted.Session.ID == completed.ID {
-		t.Fatal("relogin must create a distinct session ID")
+	restarted := decided[session.StartSession](t, relogin, err)
+	if restarted.Session.ID == sessionID {
+		t.Errorf("relogin reused session ID %q, want a distinct lifecycle", sessionID)
 	}
 }
 
-func TestDecideRejectsInvalidTransitionsWithoutMutatingSnapshot(t *testing.T) {
+// An impossible transition and a stale timestamp are both refused, and neither
+// touches the snapshot it was given. An event at the latest time is accepted.
+func TestDecideRejectsInvalidTransitionsAndStaleEvents(t *testing.T) {
 	t.Parallel()
 
-	key := mustSessionKey(t, "tenant-a", "alice", "192.0.2.10")
-	at := mustTime(t, "2026-08-21T10:00:00Z")
-	active := Session{
-		ID:      "session-1",
-		Key:     key,
-		LoginAt: at,
-		States:  []SessionState{{Tags: []string{"user"}, ValidFrom: at}},
-	}
+	key := sessiontest.Key("tenant-a", "alice", "192.0.2.10")
+	at := sessiontest.At("10:00")
+	active := sessiontest.ActiveSession(key, sessiontest.SessionID(1), sessiontest.EventID(1), at, "user")
 
-	tests := []struct {
+	invalidTransitions := []struct {
 		name     string
-		snapshot CurrentSessionSnapshot
-		decide   func(CurrentSessionSnapshot) (Mutation, error)
+		snapshot session.CurrentSessionSnapshot
+		decide   func(session.CurrentSessionSnapshot) (session.Mutation, error)
 	}{
 		{
 			name:     "login while active",
-			snapshot: CurrentSessionSnapshot{Active: &active},
-			decide: func(snapshot CurrentSessionSnapshot) (Mutation, error) {
-				return DecideLogin(snapshot, LoginCommand{EventID: eventIDLower, SessionID: "session-2", Key: key, Tags: []string{"user"}, Timestamp: at.Add(time.Minute)})
+			snapshot: active,
+			decide: func(snapshot session.CurrentSessionSnapshot) (session.Mutation, error) {
+				return session.DecideLogin(snapshot, session.LoginCommand{
+					EventID: sessiontest.EventID(2), SessionID: sessiontest.SessionID(2), Key: key,
+					Tags: []string{"user"}, Timestamp: at.Add(time.Minute),
+				})
 			},
 		},
 		{
 			name: "update while inactive",
-			decide: func(snapshot CurrentSessionSnapshot) (Mutation, error) {
-				return DecideUpdate(snapshot, UpdateCommand{EventID: eventIDLower, Key: key, Tags: []string{"admin"}, Timestamp: at})
+			decide: func(snapshot session.CurrentSessionSnapshot) (session.Mutation, error) {
+				return session.DecideUpdate(snapshot, session.UpdateCommand{
+					EventID: sessiontest.EventID(2), Key: key, Tags: []string{"admin"}, Timestamp: at,
+				})
 			},
 		},
 		{
 			name: "logout while inactive",
-			decide: func(snapshot CurrentSessionSnapshot) (Mutation, error) {
-				return DecideLogout(snapshot, LogoutCommand{EventID: eventIDLower, Key: key, Timestamp: at})
+			decide: func(snapshot session.CurrentSessionSnapshot) (session.Mutation, error) {
+				return session.DecideLogout(snapshot, session.LogoutCommand{
+					EventID: sessiontest.EventID(2), Key: key, Timestamp: at,
+				})
 			},
 		},
 	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			before := cloneSnapshotForTest(tt.snapshot)
-			if _, err := tt.decide(tt.snapshot); !errors.Is(err, ErrInvalidTransition) {
-				t.Fatalf("error = %v, want ErrInvalidTransition", err)
-			}
-			if !reflect.DeepEqual(tt.snapshot, before) {
-				t.Fatalf("snapshot mutated: got %+v, want %+v", tt.snapshot, before)
-			}
-		})
-	}
-}
-
-func TestDecideRejectsStaleAndAcceptsEqualTimestamp(t *testing.T) {
-	t.Parallel()
-
-	key := mustSessionKey(t, "tenant-a", "alice", "192.0.2.10")
-	at := mustTime(t, "2026-08-21T10:00:00Z")
-	active := Session{ID: "session-1", Key: key, LoginAt: at, States: []SessionState{{Tags: []string{"user"}, ValidFrom: at}}}
-	snapshot := CurrentSessionSnapshot{LastEventAt: timePointer(at), Active: &active}
-
-	if _, err := DecideUpdate(snapshot, UpdateCommand{EventID: eventIDLower, Key: key, Tags: []string{"admin"}, Timestamp: at.Add(-time.Nanosecond)}); !errors.Is(err, ErrStaleEvent) {
-		t.Fatalf("stale error = %v, want ErrStaleEvent", err)
-	}
-	if _, err := DecideUpdate(snapshot, UpdateCommand{EventID: eventIDLower, Key: key, Tags: []string{"admin"}, Timestamp: at}); err != nil {
-		t.Fatalf("equal timestamp error = %v", err)
-	}
-}
-
-func mustSessionKey(t *testing.T, tenantID, username, ip string) SessionKey {
-	t.Helper()
-	key, err := NewSessionKey(tenantID, username, ip)
-	if err != nil {
-		t.Fatalf("NewSessionKey() error = %v", err)
-	}
-	return key
-}
-
-func mustTime(t *testing.T, value string) time.Time {
-	t.Helper()
-	parsed, err := time.Parse(time.RFC3339Nano, value)
-	if err != nil {
-		t.Fatalf("time.Parse(%q) error = %v", value, err)
-	}
-	return parsed
-}
-
-func timePointer(value time.Time) *time.Time {
-	return &value
-}
-
-func sessionPointer(value Session) *Session {
-	return &value
-}
-
-func cloneSnapshotForTest(snapshot CurrentSessionSnapshot) CurrentSessionSnapshot {
-	clone := snapshot
-	if snapshot.LastEventAt != nil {
-		clone.LastEventAt = timePointer(*snapshot.LastEventAt)
-	}
-	if snapshot.Active != nil {
-		active := *snapshot.Active
-		active.States = append([]SessionState(nil), snapshot.Active.States...)
-		for index := range active.States {
-			active.States[index].Tags = append([]string(nil), active.States[index].Tags...)
-			if active.States[index].ValidTo != nil {
-				active.States[index].ValidTo = timePointer(*active.States[index].ValidTo)
-			}
+	for _, test := range invalidTransitions {
+		before := snapshotContents(t, test.snapshot)
+		if _, err := test.decide(test.snapshot); !errors.Is(err, session.ErrInvalidTransition) {
+			t.Errorf("%s: error = %v, want ErrInvalidTransition", test.name, err)
 		}
-		clone.Active = &active
+		if after := snapshotContents(t, test.snapshot); after != before {
+			t.Errorf("%s: snapshot mutated:\n got %s\nwant %s", test.name, after, before)
+		}
 	}
-	return clone
+
+	update := func(timestamp time.Time) error {
+		_, err := session.DecideUpdate(active, session.UpdateCommand{
+			EventID: sessiontest.EventID(2), Key: key, Tags: []string{"admin"}, Timestamp: timestamp,
+		})
+		return err
+	}
+	if err := update(at.Add(-time.Nanosecond)); !errors.Is(err, session.ErrStaleEvent) {
+		t.Errorf("error just before the latest event = %v, want ErrStaleEvent", err)
+	}
+	if err := update(at); err != nil {
+		t.Errorf("error at the latest event time = %v, want acceptance", err)
+	}
+}
+
+// decided asserts that a decision succeeded and produced the wanted mutation.
+func decided[Want session.Mutation](t *testing.T, mutation session.Mutation, err error) Want {
+	t.Helper()
+	if err != nil {
+		t.Fatalf("Decide() error = %v", err)
+	}
+	got, ok := mutation.(Want)
+	if !ok {
+		t.Fatalf("mutation = %T, want %T", mutation, got)
+	}
+	return got
+}
+
+// snapshotContents renders a snapshot including the values behind its pointers,
+// so a test can prove a decision left its input untouched.
+func snapshotContents(t *testing.T, snapshot session.CurrentSessionSnapshot) string {
+	t.Helper()
+	encoded, err := json.Marshal(snapshot)
+	if err != nil {
+		t.Fatalf("encode snapshot: %v", err)
+	}
+	return string(encoded)
 }

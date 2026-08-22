@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
@@ -15,17 +16,22 @@ import (
 	"github.com/Bennybl/session-handler/internal/repository/memory"
 	"github.com/Bennybl/session-handler/internal/service"
 	"github.com/Bennybl/session-handler/internal/session"
+	"github.com/Bennybl/session-handler/internal/sessiontest"
 )
 
+const queryPath = "/v1/sessions/query"
+
+// The handler decodes a generic filter list without interpreting it, and
+// answers with complete session histories.
 func TestQueryDecodesGenericSpecificationAndEncodesCompleteHistory(t *testing.T) {
 	t.Parallel()
-	loginAt := mustHTTPTime(t, "2026-08-21T10:00:00Z")
-	changedAt := mustHTTPTime(t, "2026-08-21T10:30:00Z")
-	logoutAt := mustHTTPTime(t, "2026-08-21T11:00:00Z")
-	wantResult := session.QueryResult{
+
+	loginAt, changedAt, logoutAt := sessiontest.At("10:00"), sessiontest.At("10:30"), sessiontest.At("11:00")
+	sessionID := sessiontest.SessionID(1101)
+	result := session.QueryResult{
 		Sessions: []session.Session{{
-			ID:      "00000000-0000-4000-8000-000000001101",
-			Key:     session.SessionKey{TenantID: "tenant-a", Username: "alice", IP: "192.0.2.10"},
+			ID:      sessionID,
+			Key:     sessiontest.Key("tenant-a", "alice", "192.0.2.10"),
 			LoginAt: loginAt, LogoutAt: &logoutAt, LastEventID: "internal-event-id",
 			States: []session.SessionState{
 				{Tags: []string{"user"}, ValidFrom: loginAt, ValidTo: &changedAt},
@@ -34,57 +40,71 @@ func TestQueryDecodesGenericSpecificationAndEncodesCompleteHistory(t *testing.T)
 		}},
 		NextCursor: "next-page",
 	}
-	var gotRequest service.QueryRequest
-	query := queryServiceFunc(func(_ context.Context, request service.QueryRequest) (session.QueryResult, error) {
-		gotRequest = request
-		return wantResult, nil
-	})
-	handler := mustHandler(t, query)
-	body := `{
+	var got service.QueryRequest
+	handler := newHandler(t, queryServiceFunc(func(_ context.Context, request service.QueryRequest) (session.QueryResult, error) {
+		got = request
+		return result, nil
+	}))
+
+	response := postQuery(handler, `{
 		"filters": [
 			{"field":"tenantId","operator":"eq","value":"tenant-a"},
 			{"field":"activity","operator":"overlaps","value":{"from":"2026-08-21T10:00:00Z","to":"2026-08-21T12:00:00Z"}},
 			{"field":"tags","operator":"containsAll","value":["admin","user"]}
 		],
 		"page":{"limit":7,"cursor":"current-page"}
-	}`
-
-	response := performRequest(handler, http.MethodPost, "/v1/sessions/query", body)
+	}`)
 	if response.Code != http.StatusOK {
 		t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
 	}
-	if gotRequest.Page != (session.PageRequest{Limit: 7, Cursor: "current-page"}) || len(gotRequest.Filters) != 3 {
-		t.Fatalf("query request = %+v", gotRequest)
+
+	// Each filter reaches the service with its value shape intact.
+	if want := (session.PageRequest{Limit: 7, Cursor: "current-page"}); got.Page != want {
+		t.Errorf("page = %+v, want %+v", got.Page, want)
 	}
-	if gotRequest.Filters[0].Field != "tenantId" || gotRequest.Filters[0].Operator != "eq" || gotRequest.Filters[0].Value != "tenant-a" {
-		t.Fatalf("first filter = %+v", gotRequest.Filters[0])
+	if len(got.Filters) != 3 {
+		t.Fatalf("filters = %+v, want 3", got.Filters)
 	}
-	interval, ok := gotRequest.Filters[1].Value.(map[string]any)
-	if !ok || interval["from"] != "2026-08-21T10:00:00Z" || interval["to"] != "2026-08-21T12:00:00Z" {
-		t.Fatalf("interval value = %#v", gotRequest.Filters[1].Value)
+	if want := sessiontest.Filter("tenantId", "eq", "tenant-a"); got.Filters[0] != want {
+		t.Errorf("scalar filter = %+v, want %+v", got.Filters[0], want)
 	}
-	if !reflect.DeepEqual(gotRequest.Filters[2].Value, []any{"admin", "user"}) {
-		t.Fatalf("tag value = %#v", gotRequest.Filters[2].Value)
+	wantInterval := map[string]any{"from": "2026-08-21T10:00:00Z", "to": "2026-08-21T12:00:00Z"}
+	if !reflect.DeepEqual(got.Filters[1].Value, wantInterval) {
+		t.Errorf("interval filter value = %#v, want %#v", got.Filters[1].Value, wantInterval)
+	}
+	if want := []any{"admin", "user"}; !reflect.DeepEqual(got.Filters[2].Value, want) {
+		t.Errorf("list filter value = %#v, want %#v", got.Filters[2].Value, want)
 	}
 
 	var decoded queryHTTPResponse
-	decodeHTTPJSON(t, response, &decoded)
-	if decoded.NextCursor != "next-page" || len(decoded.Sessions) != 1 || len(decoded.Sessions[0].States) != 2 {
-		t.Fatalf("query response = %+v", decoded)
+	decodeJSON(t, response, &decoded)
+	if decoded.NextCursor != "next-page" {
+		t.Errorf("nextCursor = %q, want %q", decoded.NextCursor, "next-page")
 	}
-	got := decoded.Sessions[0]
-	if got.ID != wantResult.Sessions[0].ID || got.TenantID != "tenant-a" || got.Username != "alice" || got.IP != "192.0.2.10" ||
-		!got.LoginAt.Equal(loginAt) || got.LogoutAt == nil || !got.LogoutAt.Equal(logoutAt) {
-		t.Fatalf("session response = %+v", got)
+	if len(decoded.Sessions) != 1 {
+		t.Fatalf("sessions = %+v, want 1", decoded.Sessions)
 	}
-	if strings.Contains(response.Body.String(), "internal-event-id") || strings.Contains(response.Body.String(), "lastEventId") {
-		t.Fatalf("response exposed internal event identity: %s", response.Body.String())
+	encoded := decoded.Sessions[0]
+	if encoded.ID != sessionID || encoded.TenantID != "tenant-a" || encoded.Username != "alice" || encoded.IP != "192.0.2.10" {
+		t.Errorf("session identity = %+v, want %q for tenant-a/alice/192.0.2.10", encoded, sessionID)
+	}
+	if !encoded.LoginAt.Equal(loginAt) || encoded.LogoutAt == nil || !encoded.LogoutAt.Equal(logoutAt) {
+		t.Errorf("lifecycle = %v to %v, want %v to %v", encoded.LoginAt, encoded.LogoutAt, loginAt, logoutAt)
+	}
+	if len(encoded.States) != 2 {
+		t.Errorf("states = %+v, want the complete two-state history", encoded.States)
+	}
+
+	// The event ID is internal deduplication metadata and must not leak.
+	if body := response.Body.String(); strings.Contains(body, "internal-event-id") || strings.Contains(body, "lastEventId") {
+		t.Errorf("response exposed the internal event identity: %s", body)
 	}
 }
 
-func TestQueryRejectsMalformedAndUnsupportedRequests(t *testing.T) {
+func TestQueryRejectsMalformedRequestsAndHidesUnexpectedFailures(t *testing.T) {
 	t.Parallel()
-	handler := newMemoryHandler(t, mustHTTPTime(t, "2026-08-21T12:00:00Z"), nil)
+
+	_, handler := newMemoryHandler(t, fixedClock(sessiontest.At("12:00")))
 	tests := []struct {
 		name string
 		body string
@@ -101,100 +121,95 @@ func TestQueryRejectsMalformedAndUnsupportedRequests(t *testing.T) {
 		{name: "null value", body: `{"filters":[{"field":"tenantId","operator":"eq","value":null}]}`},
 		{name: "unsupported operator", body: `{"filters":[{"field":"tenantId","operator":"contains","value":"tenant-a"}]}`},
 		{name: "unsupported logical field", body: `{"filters":[{"field":"email","operator":"eq","value":"a@example.com"}]}`},
-		{name: "invalid limit", body: `{"page":{"limit":201}}`},
+		{name: "limit above the maximum", body: `{"page":{"limit":201}}`},
 		{name: "invalid cursor", body: `{"page":{"cursor":"not-a-cursor"}}`},
 		{name: "unknown page field", body: `{"page":{"offset":1}}`},
 	}
+
 	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			response := performRequest(handler, http.MethodPost, "/v1/sessions/query", test.body)
-			if response.Code != http.StatusBadRequest {
-				t.Fatalf("status = %d, want 400; body = %s", response.Code, response.Body.String())
-			}
-			var problem errorHTTPResponse
-			decodeHTTPJSON(t, response, &problem)
-			if problem.Error == "" {
-				t.Fatal("error response has no message")
-			}
-		})
+		response := postQuery(handler, test.body)
+		if response.Code != http.StatusBadRequest {
+			t.Errorf("%s: status = %d, want 400; body = %s", test.name, response.Code, response.Body.String())
+			continue
+		}
+		var problem errorHTTPResponse
+		decodeJSON(t, response, &problem)
+		if problem.Error == "" {
+			t.Errorf("%s: the error response carries no message", test.name)
+		}
+	}
+
+	// Queries are the only business route; events arrive through the stream.
+	queries := 0
+	counting := newHandler(t, queryServiceFunc(func(context.Context, service.QueryRequest) (session.QueryResult, error) {
+		queries++
+		return session.QueryResult{}, nil
+	}))
+	if got := request(counting, http.MethodPost, "/v1/sessions/events", `{}`); got.Code != http.StatusNotFound {
+		t.Errorf("POST /v1/sessions/events status = %d, want 404", got.Code)
+	}
+	if got := request(counting, http.MethodGet, queryPath, ""); got.Code != http.StatusMethodNotAllowed {
+		t.Errorf("GET %s status = %d, want 405", queryPath, got.Code)
+	}
+	if queries != 0 {
+		t.Errorf("query service calls = %d, want 0", queries)
+	}
+
+	// An unexpected failure is a 500 that reveals nothing about its cause.
+	failing := newHandler(t, queryServiceFunc(func(context.Context, service.QueryRequest) (session.QueryResult, error) {
+		return session.QueryResult{}, errors.New("database password must stay private")
+	}))
+	response := postQuery(failing, `{}`)
+	if response.Code != http.StatusInternalServerError {
+		t.Errorf("status = %d, want 500", response.Code)
+	}
+	if strings.Contains(response.Body.String(), "password") {
+		t.Errorf("response leaked the internal failure: %s", response.Body.String())
 	}
 }
 
-func TestQueryEmptyFiltersDefaultToNowAndCursorPreservesEvaluationTime(t *testing.T) {
+// Without an activity filter a query means "active now", and a cursor keeps
+// that instant fixed so later pages stay consistent as the clock moves.
+func TestQueryCursorPinsTheEvaluationTime(t *testing.T) {
 	t.Parallel()
-	now := mustHTTPTime(t, "2026-08-21T12:00:00Z")
+
+	now := sessiontest.At("12:00")
 	currentTime := now
-	application, handler := seededMemoryHandler(t, func() time.Time { return currentTime })
+	application, handler := newMemoryHandler(t, func() time.Time { return currentTime },
+		login("alice", "192.0.2.10", sessiontest.At("10:00"), "user"),
+		login("bob", "192.0.2.11", sessiontest.At("11:00"), "admin"),
+		login("carol", "192.0.2.12", sessiontest.At("08:00"), "past"),
+		logout("carol", "192.0.2.12", sessiontest.At("09:00")),
+	)
 
-	first := performRequest(handler, http.MethodPost, "/v1/sessions/query", `{"page":{"limit":1}}`)
-	if first.Code != http.StatusOK {
-		t.Fatalf("first status = %d, body = %s", first.Code, first.Body.String())
-	}
-	var firstPage queryHTTPResponse
-	decodeHTTPJSON(t, first, &firstPage)
-	if len(firstPage.Sessions) != 1 || firstPage.NextCursor == "" {
-		t.Fatalf("first page = %+v", firstPage)
+	// Carol logged out before now, so only Alice and Bob are active.
+	first := decodeQuery(t, handler, `{"page":{"limit":1}}`)
+	if len(first.Sessions) != 1 || first.NextCursor == "" {
+		t.Fatalf("first page = %d sessions, cursor %q; want 1 session and a cursor", len(first.Sessions), first.NextCursor)
 	}
 
-	for index, key := range []struct{ username, ip string }{{"alice", "192.0.2.10"}, {"bob", "192.0.2.11"}} {
-		err := application.ApplyEvent(context.Background(), service.Event{
-			EventID: "92000000-0000-4000-8000-00000000000" + string(rune('1'+index)),
-			Type:    service.EventLogout, TenantID: "tenant-a", Username: key.username, IP: key.ip,
-			Timestamp: now.Add(time.Hour),
-		})
-		if err != nil {
-			t.Fatalf("logout %s: %v", key.username, err)
+	// Both log out, and the clock moves past their logout.
+	for _, active := range []struct{ username, ip string }{{"alice", "192.0.2.10"}, {"bob", "192.0.2.11"}} {
+		event := logout(active.username, active.ip, now.Add(time.Hour))
+		if err := application.ApplyEvent(context.Background(), event); err != nil {
+			t.Fatalf("log %s out: %v", active.username, err)
 		}
 	}
 	currentTime = now.Add(2 * time.Hour)
-	secondBody, err := json.Marshal(map[string]any{"page": map[string]any{"limit": 1, "cursor": firstPage.NextCursor}})
-	if err != nil {
-		t.Fatalf("encode second request: %v", err)
+
+	// The cursor still evaluates at 12:00, so the second page is reachable.
+	second := decodeQuery(t, handler, fmt.Sprintf(`{"page":{"limit":1,"cursor":%q}}`, first.NextCursor))
+	if len(second.Sessions) != 1 || second.NextCursor != "" {
+		t.Fatalf("second page = %d sessions, cursor %q; want 1 session and no cursor", len(second.Sessions), second.NextCursor)
 	}
-	second := performRequest(handler, http.MethodPost, "/v1/sessions/query", string(secondBody))
-	if second.Code != http.StatusOK {
-		t.Fatalf("second status = %d, body = %s", second.Code, second.Body.String())
-	}
-	var secondPage queryHTTPResponse
-	decodeHTTPJSON(t, second, &secondPage)
-	if len(secondPage.Sessions) != 1 || secondPage.NextCursor != "" || secondPage.Sessions[0].ID == firstPage.Sessions[0].ID {
-		t.Fatalf("second page = %+v after first = %+v", secondPage, firstPage)
+	if second.Sessions[0].ID == first.Sessions[0].ID {
+		t.Fatalf("both pages returned session %q", first.Sessions[0].ID)
 	}
 
-	withoutCursor := performRequest(handler, http.MethodPost, "/v1/sessions/query", `{}`)
-	var current queryHTTPResponse
-	decodeHTTPJSON(t, withoutCursor, &current)
-	if withoutCursor.Code != http.StatusOK || len(current.Sessions) != 0 {
-		t.Fatalf("current page = %+v, status = %d", current, withoutCursor.Code)
-	}
-}
-
-func TestOnlyQueryBusinessRouteIsExposed(t *testing.T) {
-	t.Parallel()
-	calls := 0
-	handler := mustHandler(t, queryServiceFunc(func(context.Context, service.QueryRequest) (session.QueryResult, error) {
-		calls++
-		return session.QueryResult{}, nil
-	}))
-
-	event := performRequest(handler, http.MethodPost, "/v1/sessions/events", `{}`)
-	if event.Code != http.StatusNotFound || calls != 0 {
-		t.Fatalf("event route status = %d, query calls = %d", event.Code, calls)
-	}
-	wrongMethod := performRequest(handler, http.MethodGet, "/v1/sessions/query", "")
-	if wrongMethod.Code != http.StatusMethodNotAllowed || calls != 0 {
-		t.Fatalf("GET query status = %d, query calls = %d", wrongMethod.Code, calls)
-	}
-}
-
-func TestQueryMapsUnexpectedServiceFailureToInternalServerError(t *testing.T) {
-	t.Parallel()
-	handler := mustHandler(t, queryServiceFunc(func(context.Context, service.QueryRequest) (session.QueryResult, error) {
-		return session.QueryResult{}, errors.New("database password must stay private")
-	}))
-	response := performRequest(handler, http.MethodPost, "/v1/sessions/query", `{}`)
-	if response.Code != http.StatusInternalServerError || strings.Contains(response.Body.String(), "password") {
-		t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
+	// A fresh query uses the current clock, where nobody is active.
+	current := decodeQuery(t, handler, `{}`)
+	if len(current.Sessions) != 0 {
+		t.Fatalf("sessions active at %v = %+v, want none", currentTime, current.Sessions)
 	}
 }
 
@@ -204,6 +219,8 @@ func (function queryServiceFunc) Query(ctx context.Context, request service.Quer
 	return function(ctx, request)
 }
 
+// The response shapes below are written out rather than reused from the handler
+// so the tests pin the wire contract independently of the encoder.
 type queryHTTPResponse struct {
 	Sessions   []sessionHTTPResponse `json:"sessions"`
 	NextCursor string                `json:"nextCursor"`
@@ -229,7 +246,7 @@ type errorHTTPResponse struct {
 	Error string `json:"error"`
 }
 
-func mustHandler(t *testing.T, query QueryService) http.Handler {
+func newHandler(t *testing.T, query QueryService) http.Handler {
 	t.Helper()
 	handler, err := NewHandler(query)
 	if err != nil {
@@ -238,85 +255,77 @@ func mustHandler(t *testing.T, query QueryService) http.Handler {
 	return handler
 }
 
-func newMemoryHandler(t *testing.T, now time.Time, ids []string) http.Handler {
+// newMemoryHandler builds the real service and handler over an in-memory store,
+// applies the seed events, and returns both so a test can keep driving events.
+func newMemoryHandler(t *testing.T, now func() time.Time, events ...service.Event) (*service.SessionService, http.Handler) {
 	t.Helper()
-	repository := memory.New()
-	t.Cleanup(func() { _ = repository.Close() })
-	index := 0
-	application, err := service.New(service.Dependencies{
-		Repository: repository,
-		Now:        func() time.Time { return now },
-		NewSessionID: func() (string, error) {
-			if index >= len(ids) {
-				return "00000000-0000-4000-8000-000000009999", nil
-			}
-			id := ids[index]
-			index++
-			return id, nil
-		},
-	})
-	if err != nil {
-		t.Fatalf("service.New() error = %v", err)
-	}
-	return mustHandler(t, application)
-}
+	repo := memory.New()
+	t.Cleanup(func() { _ = repo.Close() })
 
-func seededMemoryHandler(t *testing.T, now func() time.Time) (*service.SessionService, http.Handler) {
-	t.Helper()
-	repository := memory.New()
-	t.Cleanup(func() { _ = repository.Close() })
-	ids := []string{
-		"00000000-0000-4000-8000-000000001101",
-		"00000000-0000-4000-8000-000000001102",
-		"00000000-0000-4000-8000-000000001103",
-	}
-	index := 0
+	assigned := 0
 	application, err := service.New(service.Dependencies{
-		Repository: repository,
+		Repository: repo,
 		Now:        now,
 		NewSessionID: func() (string, error) {
-			id := ids[index]
-			index++
-			return id, nil
+			assigned++
+			return sessiontest.SessionID(1100 + assigned), nil
 		},
 	})
 	if err != nil {
 		t.Fatalf("service.New() error = %v", err)
-	}
-	events := []service.Event{
-		{EventID: "91000000-0000-4000-8000-000000000001", Type: service.EventLogin, TenantID: "tenant-a", Username: "alice", IP: "192.0.2.10", Tags: []string{"user"}, Timestamp: mustHTTPTime(t, "2026-08-21T10:00:00Z")},
-		{EventID: "91000000-0000-4000-8000-000000000002", Type: service.EventLogin, TenantID: "tenant-a", Username: "bob", IP: "192.0.2.11", Tags: []string{"admin"}, Timestamp: mustHTTPTime(t, "2026-08-21T11:00:00Z")},
-		{EventID: "91000000-0000-4000-8000-000000000003", Type: service.EventLogin, TenantID: "tenant-a", Username: "carol", IP: "192.0.2.12", Tags: []string{"past"}, Timestamp: mustHTTPTime(t, "2026-08-21T08:00:00Z")},
-		{EventID: "91000000-0000-4000-8000-000000000004", Type: service.EventLogout, TenantID: "tenant-a", Username: "carol", IP: "192.0.2.12", Timestamp: mustHTTPTime(t, "2026-08-21T09:00:00Z")},
 	}
 	for _, event := range events {
 		if err := application.ApplyEvent(context.Background(), event); err != nil {
-			t.Fatalf("seed event %s: %v", event.EventID, err)
+			t.Fatalf("seed %s for %s: %v", event.Type, event.Username, err)
 		}
 	}
-	return application, mustHandler(t, application)
+	return application, newHandler(t, application)
 }
 
-func performRequest(handler http.Handler, method, target, body string) *httptest.ResponseRecorder {
-	request := httptest.NewRequest(method, target, bytes.NewBufferString(body))
-	request.Header.Set("Content-Type", "application/json")
+func login(username, ip string, at time.Time, tags ...string) service.Event {
+	return service.Event{
+		EventID: sessiontest.NextEventID(), Type: service.EventLogin,
+		TenantID: "tenant-a", Username: username, IP: ip, Tags: tags, Timestamp: at,
+	}
+}
+
+func logout(username, ip string, at time.Time) service.Event {
+	return service.Event{
+		EventID: sessiontest.NextEventID(), Type: service.EventLogout,
+		TenantID: "tenant-a", Username: username, IP: ip, Timestamp: at,
+	}
+}
+
+func postQuery(handler http.Handler, body string) *httptest.ResponseRecorder {
+	return request(handler, http.MethodPost, queryPath, body)
+}
+
+func decodeQuery(t *testing.T, handler http.Handler, body string) queryHTTPResponse {
+	t.Helper()
+	response := postQuery(handler, body)
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
+	}
+	var decoded queryHTTPResponse
+	decodeJSON(t, response, &decoded)
+	return decoded
+}
+
+func request(handler http.Handler, method, target, body string) *httptest.ResponseRecorder {
+	httpRequest := httptest.NewRequest(method, target, bytes.NewBufferString(body))
+	httpRequest.Header.Set("Content-Type", "application/json")
 	response := httptest.NewRecorder()
-	handler.ServeHTTP(response, request)
+	handler.ServeHTTP(response, httpRequest)
 	return response
 }
 
-func decodeHTTPJSON(t *testing.T, response *httptest.ResponseRecorder, destination any) {
+func decodeJSON(t *testing.T, response *httptest.ResponseRecorder, destination any) {
 	t.Helper()
 	if err := json.NewDecoder(response.Body).Decode(destination); err != nil {
 		t.Fatalf("decode response %q: %v", response.Body.String(), err)
 	}
 }
 
-func mustHTTPTime(t *testing.T, value string) time.Time {
-	t.Helper()
-	parsed, err := time.Parse(time.RFC3339Nano, value)
-	if err != nil {
-		t.Fatalf("time.Parse(%q) error = %v", value, err)
-	}
-	return parsed
+func fixedClock(at time.Time) func() time.Time {
+	return func() time.Time { return at }
 }
