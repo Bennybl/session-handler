@@ -27,7 +27,7 @@ Partition ownership supplies same-key serialization. The service and repository 
 
 The design requires every event write to enter through the configured `eventstream.Source`. Kafka producers must derive a stable record key from the complete canonical `SessionKey` (tenant ID, username, and canonical IP), and the Kafka topic's partition count must not change while the process runs. Exactly one worker processes each assigned partition, and it completes every retry for one event before taking the next event in that partition. Exactly one application process may write to the in-memory database. Workers for different Kafka partitions can execute service processing concurrently.
 
-SQLite deliberately retains exactly one `database/sql` connection. A bare `:memory:` database belongs to its connection, and the single connection is the embedded SQL serialization point. Partition workers may execute service code concurrently, but SQL transactions serialize at that connection.
+SQLite uses a uniquely named shared in-memory database and a bounded `database/sql` connection pool. Kafka partition workers can therefore access SQL concurrently and all connections see the same schema and data. Foreign-key enforcement and the busy timeout are configured on every connection. SQLite still permits only one writer at a time; transactions provide atomic persistence and SQLite performs its own write locking.
 
 ## Data and query behavior
 
